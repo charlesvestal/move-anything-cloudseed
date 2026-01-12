@@ -1,0 +1,20 @@
+{
+  "id": "cloudseed",
+  "name": "CloudSeed",
+  "version": "0.1.0",
+  "description": "Algorithmic reverb based on CloudSeedCore",
+  "author": "Ghost Note Audio / Charles Vestal",
+  "dsp": "cloudseed.so",
+  "api_version": 1,
+  "capabilities": {
+    "chainable": true,
+    "component_type": "audio_fx",
+    "chain_params": [
+      {"key": "decay", "name": "Decay", "type": "float", "min": 0.0, "max": 1.0, "default": 0.5, "step": 0.05},
+      {"key": "mix", "name": "Mix", "type": "float", "min": 0.0, "max": 1.0, "default": 0.3, "step": 0.05},
+      {"key": "predelay", "name": "Pre-Delay", "type": "float", "min": 0.0, "max": 1.0, "default": 0.1, "step": 0.05},
+      {"key": "size", "name": "Size", "type": "float", "min": 0.0, "max": 1.0, "default": 0.5, "step": 0.05},
+      {"key": "damping", "name": "Damping", "type": "float", "min": 0.0, "max": 1.0, "default": 0.5, "step": 0.05}
+    ]
+  }
+}
