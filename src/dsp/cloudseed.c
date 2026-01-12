@@ -267,9 +267,9 @@ static void fx_process_block(int16_t *audio_inout, int frames) {
         g_predelay_pos++;
 
         /* === Diffuser Network (4 cascaded allpass filters) === */
-        /* Add feedback from delay network to diffuser input */
-        float diff_in_l = pd_l + g_fb1_l;
-        float diff_in_r = pd_r + g_fb1_r;
+        /* Diffuser input is just pre-delayed signal (feedback goes to delay writes) */
+        float diff_in_l = pd_l;
+        float diff_in_r = pd_r;
 
         float d1_l = allpass(diff_in_l, g_diff1_l, DIFF1_DELAY, g_diff_pos);
         float d1_r = allpass(diff_in_r, g_diff1_r, DIFF1_DELAY, g_diff_pos);
@@ -296,36 +296,44 @@ static void fx_process_block(int16_t *audio_inout, int frames) {
         if (g_lfo_phase_r >= 1.0f) g_lfo_phase_r -= 1.0f;
 
         /* Calculate modulated delay times */
-        int mod_delay1_l = delay1 + (int)(lfo_l * LFO_DEPTH_SAMPLES);
-        int mod_delay2_l = delay2 + (int)(lfo_r * LFO_DEPTH_SAMPLES);  /* Alternate LFO */
-        int mod_delay3_l = delay3 + (int)(lfo_l * LFO_DEPTH_SAMPLES);
-        int mod_delay4_l = delay4 + (int)(lfo_r * LFO_DEPTH_SAMPLES);
+        int mod_delay1_l = delay1 + (int)roundf(lfo_l * LFO_DEPTH_SAMPLES);
+        int mod_delay2_l = delay2 + (int)roundf(lfo_r * LFO_DEPTH_SAMPLES);  /* Alternate LFO */
+        int mod_delay3_l = delay3 + (int)roundf(lfo_l * LFO_DEPTH_SAMPLES);
+        int mod_delay4_l = delay4 + (int)roundf(lfo_r * LFO_DEPTH_SAMPLES);
 
-        int mod_delay1_r = delay1 + (int)(lfo_r * LFO_DEPTH_SAMPLES);
-        int mod_delay2_r = delay2 + (int)(lfo_l * LFO_DEPTH_SAMPLES);
-        int mod_delay3_r = delay3 + (int)(lfo_r * LFO_DEPTH_SAMPLES);
-        int mod_delay4_r = delay4 + (int)(lfo_l * LFO_DEPTH_SAMPLES);
+        int mod_delay1_r = delay1 + (int)roundf(lfo_r * LFO_DEPTH_SAMPLES);
+        int mod_delay2_r = delay2 + (int)roundf(lfo_l * LFO_DEPTH_SAMPLES);
+        int mod_delay3_r = delay3 + (int)roundf(lfo_r * LFO_DEPTH_SAMPLES);
+        int mod_delay4_r = delay4 + (int)roundf(lfo_l * LFO_DEPTH_SAMPLES);
 
-        /* Clamp modulated delays */
+        /* Clamp modulated delays to valid range */
         if (mod_delay1_l < 1) mod_delay1_l = 1;
+        if (mod_delay1_l > DELAY_SIZE - 2) mod_delay1_l = DELAY_SIZE - 2;
         if (mod_delay2_l < 1) mod_delay2_l = 1;
+        if (mod_delay2_l > DELAY_SIZE - 2) mod_delay2_l = DELAY_SIZE - 2;
         if (mod_delay3_l < 1) mod_delay3_l = 1;
+        if (mod_delay3_l > DELAY_SIZE - 2) mod_delay3_l = DELAY_SIZE - 2;
         if (mod_delay4_l < 1) mod_delay4_l = 1;
+        if (mod_delay4_l > DELAY_SIZE - 2) mod_delay4_l = DELAY_SIZE - 2;
         if (mod_delay1_r < 1) mod_delay1_r = 1;
+        if (mod_delay1_r > DELAY_SIZE - 2) mod_delay1_r = DELAY_SIZE - 2;
         if (mod_delay2_r < 1) mod_delay2_r = 1;
+        if (mod_delay2_r > DELAY_SIZE - 2) mod_delay2_r = DELAY_SIZE - 2;
         if (mod_delay3_r < 1) mod_delay3_r = 1;
+        if (mod_delay3_r > DELAY_SIZE - 2) mod_delay3_r = DELAY_SIZE - 2;
         if (mod_delay4_r < 1) mod_delay4_r = 1;
+        if (mod_delay4_r > DELAY_SIZE - 2) mod_delay4_r = DELAY_SIZE - 2;
 
         /* === Delay Network (4 modulated delay lines) === */
-        /* Write diffuser output to delay buffers */
-        g_delay1_l[g_delay_pos & DELAY_MASK] = d4_l;
-        g_delay1_r[g_delay_pos & DELAY_MASK] = d4_r;
-        g_delay2_l[g_delay_pos & DELAY_MASK] = d4_l;
-        g_delay2_r[g_delay_pos & DELAY_MASK] = d4_r;
-        g_delay3_l[g_delay_pos & DELAY_MASK] = d4_l;
-        g_delay3_r[g_delay_pos & DELAY_MASK] = d4_r;
-        g_delay4_l[g_delay_pos & DELAY_MASK] = d4_l;
-        g_delay4_r[g_delay_pos & DELAY_MASK] = d4_r;
+        /* Write diffuser output plus Hadamard feedback to delay buffers */
+        g_delay1_l[g_delay_pos & DELAY_MASK] = d4_l + g_fb1_l;
+        g_delay1_r[g_delay_pos & DELAY_MASK] = d4_r + g_fb1_r;
+        g_delay2_l[g_delay_pos & DELAY_MASK] = d4_l + g_fb2_l;
+        g_delay2_r[g_delay_pos & DELAY_MASK] = d4_r + g_fb2_r;
+        g_delay3_l[g_delay_pos & DELAY_MASK] = d4_l + g_fb3_l;
+        g_delay3_r[g_delay_pos & DELAY_MASK] = d4_r + g_fb3_r;
+        g_delay4_l[g_delay_pos & DELAY_MASK] = d4_l + g_fb4_l;
+        g_delay4_r[g_delay_pos & DELAY_MASK] = d4_r + g_fb4_r;
 
         /* Read from delay lines with modulation */
         unsigned int read1_l = (g_delay_pos + DELAY_SIZE - mod_delay1_l) & DELAY_MASK;
