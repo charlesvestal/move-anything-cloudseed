@@ -1,0 +1,40 @@
+{
+    "name": "CloudSeed Reverb",
+    "version": 1,
+    "chain": {
+        "input": "both",
+        "synth": {
+            "module": "sf2",
+            "config": {
+                "preset": 0
+            }
+        },
+        "audio_fx": [
+            {
+                "type": "cloudseed",
+                "params": {
+                    "mix": 0.35,
+                    "decay": 0.6,
+                    "size": 0.5,
+                    "predelay": 0.1,
+                    "diffusion": 0.7,
+                    "low_cut": 0.0,
+                    "high_cut": 0.8,
+                    "mod_amount": 0.3,
+                    "mod_rate": 0.3,
+                    "cross_seed": 0.5
+                }
+            }
+        ],
+        "knob_mappings": [
+            {"cc": 71, "target": "synth", "param": "preset"},
+            {"cc": 72, "target": "fx1", "param": "mix"},
+            {"cc": 73, "target": "fx1", "param": "decay"},
+            {"cc": 74, "target": "fx1", "param": "size"},
+            {"cc": 75, "target": "fx1", "param": "diffusion"},
+            {"cc": 76, "target": "fx1", "param": "predelay"},
+            {"cc": 77, "target": "fx1", "param": "high_cut"},
+            {"cc": 78, "target": "fx1", "param": "mod_amount"}
+        ]
+    }
+}

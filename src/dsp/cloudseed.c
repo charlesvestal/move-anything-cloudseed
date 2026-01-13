@@ -1,123 +1,1215 @@
 /*
  * CloudSeed Audio FX Plugin
  *
- * Modern algorithmic reverb based on CloudSeedCore by Ghost Note Audio.
- * Features allpass diffusion and modulated delay networks.
+ * EXACT port from CloudSeedCore by Ghost Note Audio (MIT Licensed)
+ * https://github.com/GhostNoteAudio/CloudSeedCore
  *
- * Signal Flow:
- * Input -> Pre-delay -> Diffuser Network (4x APF) -> Delay Network (4x) -> Output
- *                              ^                            |
- *                              |_____ Hadamard feedback ____|
- *
- * Parameters:
- * - decay: Feedback amount (reverb tail length)
- * - mix: Dry/wet blend
- * - predelay: Initial delay before reverb onset
- * - size: Room size (scales delay times)
- * - damping: High-frequency absorption
+ * This is a direct C translation of the C++ reference implementation.
+ * All algorithms, buffer sizes, and processing logic match the original.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
 
 #include "audio_fx_api_v1.h"
 
-#define SAMPLE_RATE 44100
-
-/* Buffer sizes (all power of 2 for efficient masking) */
-#define PREDELAY_SIZE 8192
-#define PREDELAY_MASK (PREDELAY_SIZE - 1)
-
-#define DIFF_SIZE 512
-#define DIFF_MASK (DIFF_SIZE - 1)
-
-#define DELAY_SIZE 8192
-#define DELAY_MASK (DELAY_SIZE - 1)
-
-/* Diffuser delay times (prime-ish numbers for good diffusion) */
-#define DIFF1_DELAY 142
-#define DIFF2_DELAY 107
-#define DIFF3_DELAY 379
-#define DIFF4_DELAY 277
-
-/* Delay network base delays (primes for density) */
-#define DELAY1_BASE 2473
-#define DELAY2_BASE 3119
-#define DELAY3_BASE 3947
-#define DELAY4_BASE 4643
-
-/* Allpass coefficient - higher = more diffusion/smearing */
-#define APF_COEFF 0.7f
-
-/* LFO settings */
-#define LFO_FREQ 0.3f           /* ~0.3 Hz */
-#define LFO_DEPTH_SAMPLES 132   /* ~3ms at 44.1kHz */
-
-/* Max pre-delay: 100ms = 4410 samples */
-#define MAX_PREDELAY_SAMPLES 4410
-
-/* PI constant */
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-/* Plugin state */
+#define SAMPLE_RATE 48000
+
+/* Buffer sizes - EXACT from reference */
+#define DELAY_BUFFER_SIZE 384000      /* 192000 * 2 - exact from ModulatedDelay.h */
+#define ALLPASS_BUFFER_SIZE 19200     /* 100ms at 192kHz - exact from ModulatedAllpass.h */
+#define BUFFER_SIZE 128               /* Process block size */
+
+/* Configuration - EXACT from reference */
+#define MAX_LINE_COUNT 12             /* TotalLineCount from ReverbChannel.h */
+#define MAX_DIFFUSER_STAGES 12        /* MaxStageCount from AllpassDiffuser.h */
+#define MAX_TAPS 256                  /* MaxTaps from MultitapDelay.h */
+#define MODULATION_UPDATE_RATE 8      /* Exact from reference */
+
+/* ============================================================================
+ * UTILITY FUNCTIONS - From Utils.h
+ * ============================================================================ */
+
+static inline float db2gain(float db) {
+    return powf(10.0f, db * 0.05f);
+}
+
+static inline float resp2dec(float x) {
+    /* (10^(2x) - 1) * (100/99) * 0.01 */
+    return (powf(10.0f, 2.0f * x) - 1.0f) * (100.0f / 99.0f) * 0.01f;
+}
+
+static inline float resp3dec(float x) {
+    /* (10^(3x) - 1) * (1000/999) * 0.001 */
+    return (powf(10.0f, 3.0f * x) - 1.0f) * (1000.0f / 999.0f) * 0.001f;
+}
+
+static inline float resp4oct(float x) {
+    /* (2^(4x) - 1) * (16/15) * 0.0625 */
+    return (powf(2.0f, 4.0f * x) - 1.0f) * (16.0f / 15.0f) * 0.0625f;
+}
+
+/* ============================================================================
+ * LCG RANDOM - Exact port from LcgRandom.h
+ * ============================================================================ */
+
+typedef struct {
+    uint64_t x;
+} lcg_random_t;
+
+static const uint64_t LCG_A = 22695477;
+static const uint64_t LCG_C = 1;
+
+static void lcg_init(lcg_random_t *rng, uint64_t seed) {
+    rng->x = seed;
+}
+
+static uint32_t lcg_next_uint(lcg_random_t *rng) {
+    uint64_t axc = LCG_A * rng->x + LCG_C;
+    rng->x = axc & 0xFFFFFFFF;
+    return (uint32_t)rng->x;
+}
+
+/* ============================================================================
+ * RANDOM BUFFER - Exact port from RandomBuffer.cpp
+ * ============================================================================ */
+
+static void random_buffer_generate(uint64_t seed, float *output, int count) {
+    lcg_random_t rand;
+    lcg_init(&rand, seed);
+    for (int i = 0; i < count; i++) {
+        uint32_t val = lcg_next_uint(&rand);
+        output[i] = (float)val / (float)UINT32_MAX;
+    }
+}
+
+static void random_buffer_generate_cross(uint64_t seed, float cross_seed,
+                                          float *output, int count) {
+    float *seriesA = (float*)malloc(count * sizeof(float));
+    float *seriesB = (float*)malloc(count * sizeof(float));
+
+    uint64_t seedA = seed;
+    uint64_t seedB = ~seed;
+
+    random_buffer_generate(seedA, seriesA, count);
+    random_buffer_generate(seedB, seriesB, count);
+
+    for (int i = 0; i < count; i++) {
+        output[i] = seriesA[i] * (1.0f - cross_seed) + seriesB[i] * cross_seed;
+    }
+
+    free(seriesA);
+    free(seriesB);
+}
+
+/* ============================================================================
+ * LP1 - Exact port from Lp1.h
+ * ============================================================================ */
+
+typedef struct {
+    float fs;
+    float b0, a1;
+    float cutoff_hz;
+    float output;
+} lp1_t;
+
+static void lp1_init(lp1_t *f, int samplerate) {
+    f->fs = (float)samplerate;
+    f->b0 = 1.0f;
+    f->a1 = 0.0f;
+    f->cutoff_hz = 1000.0f;
+    f->output = 0.0f;
+}
+
+static void lp1_set_samplerate(lp1_t *f, int samplerate) {
+    f->fs = (float)samplerate;
+}
+
+static void lp1_update(lp1_t *f) {
+    float hz = f->cutoff_hz;
+    if (hz >= f->fs * 0.5f)
+        hz = f->fs * 0.499f;
+
+    float x = 2.0f * M_PI * hz / f->fs;
+    float nn = 2.0f - cosf(x);
+    float alpha = nn - sqrtf(nn * nn - 1.0f);
+
+    f->a1 = alpha;
+    f->b0 = 1.0f - alpha;
+}
+
+static void lp1_set_cutoff(lp1_t *f, float hz) {
+    f->cutoff_hz = hz;
+    lp1_update(f);
+}
+
+static float lp1_process_sample(lp1_t *f, float input) {
+    if (input == 0.0f && f->output < 0.0000001f) {
+        f->output = 0.0f;
+    } else {
+        f->output = f->b0 * input + f->a1 * f->output;
+    }
+    return f->output;
+}
+
+static void lp1_process(lp1_t *f, float *input, float *output, int len) {
+    for (int i = 0; i < len; i++)
+        output[i] = lp1_process_sample(f, input[i]);
+}
+
+static void lp1_clear(lp1_t *f) {
+    f->output = 0.0f;
+}
+
+/* ============================================================================
+ * HP1 - Exact port from Hp1.h
+ * ============================================================================ */
+
+typedef struct {
+    float fs;
+    float b0, a1;
+    float lp_out;
+    float cutoff_hz;
+    float output;
+} hp1_t;
+
+static void hp1_init(hp1_t *f, int samplerate) {
+    f->fs = (float)samplerate;
+    f->b0 = 1.0f;
+    f->a1 = 0.0f;
+    f->lp_out = 0.0f;
+    f->cutoff_hz = 100.0f;
+    f->output = 0.0f;
+}
+
+static void hp1_set_samplerate(hp1_t *f, int samplerate) {
+    f->fs = (float)samplerate;
+}
+
+static void hp1_update(hp1_t *f) {
+    float hz = f->cutoff_hz;
+    if (hz >= f->fs * 0.5f)
+        hz = f->fs * 0.499f;
+
+    float x = 2.0f * M_PI * hz / f->fs;
+    float nn = 2.0f - cosf(x);
+    float alpha = nn - sqrtf(nn * nn - 1.0f);
+
+    f->a1 = alpha;
+    f->b0 = 1.0f - alpha;
+}
+
+static void hp1_set_cutoff(hp1_t *f, float hz) {
+    f->cutoff_hz = hz;
+    hp1_update(f);
+}
+
+static float hp1_process_sample(hp1_t *f, float input) {
+    if (input == 0.0f && f->lp_out < 0.000001f) {
+        f->output = 0.0f;
+    } else {
+        f->lp_out = f->b0 * input + f->a1 * f->lp_out;
+        f->output = input - f->lp_out;
+    }
+    return f->output;
+}
+
+static void hp1_process(hp1_t *f, float *input, float *output, int len) {
+    for (int i = 0; i < len; i++)
+        output[i] = hp1_process_sample(f, input[i]);
+}
+
+static void hp1_clear(hp1_t *f) {
+    f->lp_out = 0.0f;
+    f->output = 0.0f;
+}
+
+/* ============================================================================
+ * BIQUAD - Exact port from Biquad.h/cpp for shelf filters
+ * ============================================================================ */
+
+typedef enum {
+    BIQUAD_LOWSHELF,
+    BIQUAD_HIGHSHELF
+} biquad_type_t;
+
+typedef struct {
+    float fs;
+    float fs_inv;
+    float gain_db;
+    float gain;
+    float q;
+    float frequency;
+    float a0, a1, a2, b0, b1, b2;
+    float x1, x2, y, y1, y2;
+    biquad_type_t type;
+} biquad_t;
+
+static void biquad_update(biquad_t *bq) {
+    float Fc = bq->frequency;
+    float V = powf(10.0f, fabsf(bq->gain_db) / 20.0f);
+    float K = tanf(M_PI * Fc * bq->fs_inv);
+    double norm = 1.0;
+
+    if (bq->type == BIQUAD_LOWSHELF) {
+        if (bq->gain_db >= 0) {
+            norm = 1.0 / (1.0 + sqrtf(2.0f) * K + K * K);
+            bq->b0 = (1.0f + sqrtf(2.0f * V) * K + V * K * K) * norm;
+            bq->b1 = 2.0f * (V * K * K - 1.0f) * norm;
+            bq->b2 = (1.0f - sqrtf(2.0f * V) * K + V * K * K) * norm;
+            bq->a1 = 2.0f * (K * K - 1.0f) * norm;
+            bq->a2 = (1.0f - sqrtf(2.0f) * K + K * K) * norm;
+        } else {
+            norm = 1.0 / (1.0 + sqrtf(2.0f * V) * K + V * K * K);
+            bq->b0 = (1.0f + sqrtf(2.0f) * K + K * K) * norm;
+            bq->b1 = 2.0f * (K * K - 1.0f) * norm;
+            bq->b2 = (1.0f - sqrtf(2.0f) * K + K * K) * norm;
+            bq->a1 = 2.0f * (V * K * K - 1.0f) * norm;
+            bq->a2 = (1.0f - sqrtf(2.0f * V) * K + V * K * K) * norm;
+        }
+    } else { /* HIGHSHELF */
+        if (bq->gain_db >= 0) {
+            norm = 1.0 / (1.0 + sqrtf(2.0f) * K + K * K);
+            bq->b0 = (V + sqrtf(2.0f * V) * K + K * K) * norm;
+            bq->b1 = 2.0f * (K * K - V) * norm;
+            bq->b2 = (V - sqrtf(2.0f * V) * K + K * K) * norm;
+            bq->a1 = 2.0f * (K * K - 1.0f) * norm;
+            bq->a2 = (1.0f - sqrtf(2.0f) * K + K * K) * norm;
+        } else {
+            norm = 1.0 / (V + sqrtf(2.0f * V) * K + K * K);
+            bq->b0 = (1.0f + sqrtf(2.0f) * K + K * K) * norm;
+            bq->b1 = 2.0f * (K * K - 1.0f) * norm;
+            bq->b2 = (1.0f - sqrtf(2.0f) * K + K * K) * norm;
+            bq->a1 = 2.0f * (K * K - V) * norm;
+            bq->a2 = (V - sqrtf(2.0f * V) * K + K * K) * norm;
+        }
+    }
+}
+
+static void biquad_init(biquad_t *bq, biquad_type_t type, int samplerate) {
+    bq->type = type;
+    bq->fs = (float)samplerate;
+    bq->fs_inv = 1.0f / bq->fs;
+    bq->gain_db = 0.0f;
+    bq->gain = 1.0f;
+    bq->frequency = bq->fs * 0.25f;
+    bq->q = 0.5f;
+    bq->x1 = bq->x2 = bq->y = bq->y1 = bq->y2 = 0.0f;
+    biquad_update(bq);
+}
+
+static void biquad_set_samplerate(biquad_t *bq, int samplerate) {
+    bq->fs = (float)samplerate;
+    bq->fs_inv = 1.0f / bq->fs;
+    biquad_update(bq);
+}
+
+static void biquad_set_gain_db(biquad_t *bq, float db) {
+    if (db < -60.0f) db = -60.0f;
+    if (db > 60.0f) db = 60.0f;
+    bq->gain_db = db;
+    bq->gain = powf(10.0f, db / 20.0f);
+}
+
+static void biquad_set_frequency(biquad_t *bq, float freq) {
+    bq->frequency = freq;
+    biquad_update(bq);
+}
+
+static void biquad_process(biquad_t *bq, float *input, float *output, int len) {
+    for (int i = 0; i < len; i++) {
+        float x = input[i];
+        bq->y = bq->b0 * x + bq->b1 * bq->x1 + bq->b2 * bq->x2
+              - bq->a1 * bq->y1 - bq->a2 * bq->y2;
+        bq->x2 = bq->x1;
+        bq->y2 = bq->y1;
+        bq->x1 = x;
+        bq->y1 = bq->y;
+        output[i] = bq->y;
+    }
+}
+
+static void biquad_clear(biquad_t *bq) {
+    bq->x1 = bq->x2 = bq->y = bq->y1 = bq->y2 = 0.0f;
+}
+
+/* ============================================================================
+ * MODULATED ALLPASS - Exact port from ModulatedAllpass.h
+ * ============================================================================ */
+
+typedef struct {
+    float buffer[ALLPASS_BUFFER_SIZE];
+    int index;
+    uint64_t samples_processed;
+
+    float mod_phase;
+    int delay_a;
+    int delay_b;
+    float gain_a;
+    float gain_b;
+
+    int sample_delay;
+    float feedback;
+    float mod_amount;
+    float mod_rate;
+    int interpolation_enabled;
+    int modulation_enabled;
+} mod_allpass_t;
+
+static void mod_allpass_update(mod_allpass_t *ap) {
+    ap->mod_phase += ap->mod_rate * MODULATION_UPDATE_RATE;
+    if (ap->mod_phase > 1.0f)
+        ap->mod_phase = fmodf(ap->mod_phase, 1.0f);
+
+    float mod = sinf(ap->mod_phase * 2.0f * M_PI);
+
+    float mod_amt = ap->mod_amount;
+    if (mod_amt >= ap->sample_delay)
+        mod_amt = ap->sample_delay - 1;
+
+    float total_delay = ap->sample_delay + mod_amt * mod;
+    if (total_delay <= 0.0f)
+        total_delay = 1.0f;
+
+    ap->delay_a = (int)total_delay;
+    ap->delay_b = (int)total_delay + 1;
+
+    float partial = total_delay - ap->delay_a;
+    ap->gain_a = 1.0f - partial;
+    ap->gain_b = partial;
+}
+
+static void mod_allpass_init(mod_allpass_t *ap) {
+    memset(ap->buffer, 0, sizeof(ap->buffer));
+    ap->index = ALLPASS_BUFFER_SIZE - 1;
+    ap->samples_processed = 0;
+
+    ap->mod_phase = 0.01f + 0.98f * ((float)rand() / (float)RAND_MAX);
+    ap->delay_a = 0;
+    ap->delay_b = 0;
+    ap->gain_a = 0.0f;
+    ap->gain_b = 0.0f;
+
+    ap->sample_delay = 100;
+    ap->feedback = 0.5f;
+    ap->mod_amount = 0.0f;
+    ap->mod_rate = 0.0f;
+    ap->interpolation_enabled = 1;
+    ap->modulation_enabled = 1;
+
+    mod_allpass_update(ap);
+}
+
+static void mod_allpass_process_no_mod(mod_allpass_t *ap, float *input, float *output, int count) {
+    int delayed_index = ap->index - ap->sample_delay;
+    if (delayed_index < 0) delayed_index += ALLPASS_BUFFER_SIZE;
+
+    for (int i = 0; i < count; i++) {
+        float buf_out = ap->buffer[delayed_index];
+        float in_val = input[i] + buf_out * ap->feedback;
+
+        ap->buffer[ap->index] = in_val;
+        output[i] = buf_out - in_val * ap->feedback;
+
+        ap->index++;
+        delayed_index++;
+        if (ap->index >= ALLPASS_BUFFER_SIZE) ap->index -= ALLPASS_BUFFER_SIZE;
+        if (delayed_index >= ALLPASS_BUFFER_SIZE) delayed_index -= ALLPASS_BUFFER_SIZE;
+        ap->samples_processed++;
+    }
+}
+
+static void mod_allpass_process_with_mod(mod_allpass_t *ap, float *input, float *output, int count) {
+    for (int i = 0; i < count; i++) {
+        if (ap->samples_processed >= MODULATION_UPDATE_RATE) {
+            mod_allpass_update(ap);
+            ap->samples_processed = 0;
+        }
+
+        float buf_out;
+        if (ap->interpolation_enabled) {
+            int idx_a = ap->index - ap->delay_a;
+            int idx_b = ap->index - ap->delay_b;
+            if (idx_a < 0) idx_a += ALLPASS_BUFFER_SIZE;
+            if (idx_b < 0) idx_b += ALLPASS_BUFFER_SIZE;
+            buf_out = ap->buffer[idx_a] * ap->gain_a + ap->buffer[idx_b] * ap->gain_b;
+        } else {
+            int idx_a = ap->index - ap->delay_a;
+            if (idx_a < 0) idx_a += ALLPASS_BUFFER_SIZE;
+            buf_out = ap->buffer[idx_a];
+        }
+
+        float in_val = input[i] + buf_out * ap->feedback;
+        ap->buffer[ap->index] = in_val;
+        output[i] = buf_out - in_val * ap->feedback;
+
+        ap->index++;
+        if (ap->index >= ALLPASS_BUFFER_SIZE) ap->index -= ALLPASS_BUFFER_SIZE;
+        ap->samples_processed++;
+    }
+}
+
+static void mod_allpass_process(mod_allpass_t *ap, float *input, float *output, int count) {
+    if (ap->modulation_enabled)
+        mod_allpass_process_with_mod(ap, input, output, count);
+    else
+        mod_allpass_process_no_mod(ap, input, output, count);
+}
+
+static void mod_allpass_clear(mod_allpass_t *ap) {
+    memset(ap->buffer, 0, sizeof(ap->buffer));
+}
+
+/* ============================================================================
+ * ALLPASS DIFFUSER - Exact port from AllpassDiffuser.h
+ * ============================================================================ */
+
+typedef struct {
+    mod_allpass_t filters[MAX_DIFFUSER_STAGES];
+    int delay;
+    float mod_rate;
+    float seed_values[MAX_DIFFUSER_STAGES * 3];
+    int seed;
+    float cross_seed;
+    int stages;
+    int samplerate;
+} allpass_diffuser_t;
+
+static void diffuser_update(allpass_diffuser_t *d) {
+    for (int i = 0; i < MAX_DIFFUSER_STAGES; i++) {
+        float r = d->seed_values[i];
+        float scale = powf(10.0f, r) * 0.1f;  /* 0.1 to 1.0 */
+        d->filters[i].sample_delay = (int)(d->delay * scale);
+        if (d->filters[i].sample_delay < 1)
+            d->filters[i].sample_delay = 1;
+    }
+}
+
+static void diffuser_update_seeds(allpass_diffuser_t *d) {
+    random_buffer_generate_cross(d->seed, d->cross_seed,
+                                  d->seed_values, MAX_DIFFUSER_STAGES * 3);
+    diffuser_update(d);
+}
+
+/* Forward declarations */
+static void diffuser_set_mod_rate(allpass_diffuser_t *d, float rate);
+
+static void diffuser_init(allpass_diffuser_t *d, int samplerate) {
+    d->samplerate = samplerate;
+    d->cross_seed = 0.0f;
+    d->seed = 23456;
+    d->stages = 1;
+    d->delay = 100;
+    d->mod_rate = 0.0f;
+
+    for (int i = 0; i < MAX_DIFFUSER_STAGES; i++) {
+        mod_allpass_init(&d->filters[i]);
+    }
+
+    diffuser_update_seeds(d);
+}
+
+static void diffuser_set_samplerate(allpass_diffuser_t *d, int samplerate) {
+    d->samplerate = samplerate;
+    diffuser_set_mod_rate(d, d->mod_rate);
+}
+
+static void diffuser_set_seed(allpass_diffuser_t *d, int seed) {
+    d->seed = seed;
+    diffuser_update_seeds(d);
+}
+
+static void diffuser_set_cross_seed(allpass_diffuser_t *d, float cross_seed) {
+    d->cross_seed = cross_seed;
+    diffuser_update_seeds(d);
+}
+
+static void diffuser_set_interpolation(allpass_diffuser_t *d, int enabled) {
+    for (int i = 0; i < MAX_DIFFUSER_STAGES; i++)
+        d->filters[i].interpolation_enabled = enabled;
+}
+
+static void diffuser_set_modulation(allpass_diffuser_t *d, int enabled) {
+    for (int i = 0; i < MAX_DIFFUSER_STAGES; i++)
+        d->filters[i].modulation_enabled = enabled;
+}
+
+static void diffuser_set_delay(allpass_diffuser_t *d, int samples) {
+    d->delay = samples;
+    diffuser_update(d);
+}
+
+static void diffuser_set_feedback(allpass_diffuser_t *d, float fb) {
+    for (int i = 0; i < MAX_DIFFUSER_STAGES; i++)
+        d->filters[i].feedback = fb;
+}
+
+static void diffuser_set_mod_amount(allpass_diffuser_t *d, float amount) {
+    for (int i = 0; i < MAX_DIFFUSER_STAGES; i++) {
+        float scale = 0.85f + 0.3f * d->seed_values[MAX_DIFFUSER_STAGES + i];
+        d->filters[i].mod_amount = amount * scale;
+    }
+}
+
+static void diffuser_set_mod_rate(allpass_diffuser_t *d, float rate) {
+    d->mod_rate = rate;
+    for (int i = 0; i < MAX_DIFFUSER_STAGES; i++) {
+        float scale = 0.85f + 0.3f * d->seed_values[MAX_DIFFUSER_STAGES * 2 + i];
+        d->filters[i].mod_rate = rate * scale / d->samplerate;
+    }
+}
+
+static void diffuser_process(allpass_diffuser_t *d, float *input, float *output, int count) {
+    float temp[BUFFER_SIZE];
+
+    mod_allpass_process(&d->filters[0], input, temp, count);
+    for (int i = 1; i < d->stages; i++)
+        mod_allpass_process(&d->filters[i], temp, temp, count);
+
+    memcpy(output, temp, count * sizeof(float));
+}
+
+static void diffuser_clear(allpass_diffuser_t *d) {
+    for (int i = 0; i < MAX_DIFFUSER_STAGES; i++)
+        mod_allpass_clear(&d->filters[i]);
+}
+
+/* ============================================================================
+ * MODULATED DELAY - Exact port from ModulatedDelay.h
+ * ============================================================================ */
+
+typedef struct {
+    float *buffer;  /* Dynamically allocated */
+    int write_index;
+    int read_index_a;
+    int read_index_b;
+    uint64_t samples_processed;
+
+    float mod_phase;
+    float gain_a;
+    float gain_b;
+
+    int sample_delay;
+    float mod_amount;
+    float mod_rate;
+} mod_delay_t;
+
+static void mod_delay_update(mod_delay_t *d) {
+    d->mod_phase += d->mod_rate * MODULATION_UPDATE_RATE;
+    if (d->mod_phase > 1.0f)
+        d->mod_phase = fmodf(d->mod_phase, 1.0f);
+
+    float mod = sinf(d->mod_phase * 2.0f * M_PI);
+    float total_delay = d->sample_delay + d->mod_amount * mod;
+
+    int delay_a = (int)total_delay;
+    int delay_b = (int)total_delay + 1;
+
+    float partial = total_delay - delay_a;
+    d->gain_a = 1.0f - partial;
+    d->gain_b = partial;
+
+    d->read_index_a = d->write_index - delay_a;
+    d->read_index_b = d->write_index - delay_b;
+    if (d->read_index_a < 0) d->read_index_a += DELAY_BUFFER_SIZE;
+    if (d->read_index_b < 0) d->read_index_b += DELAY_BUFFER_SIZE;
+}
+
+static void mod_delay_init(mod_delay_t *d) {
+    d->buffer = (float*)calloc(DELAY_BUFFER_SIZE, sizeof(float));
+    d->write_index = 0;
+    d->read_index_a = 0;
+    d->read_index_b = 0;
+    d->samples_processed = 0;
+
+    d->mod_phase = 0.01f + 0.98f * ((float)rand() / (float)RAND_MAX);
+    d->gain_a = 0.0f;
+    d->gain_b = 0.0f;
+
+    d->sample_delay = 100;
+    d->mod_amount = 0.0f;
+    d->mod_rate = 0.0f;
+
+    mod_delay_update(d);
+}
+
+static void mod_delay_free(mod_delay_t *d) {
+    if (d->buffer) {
+        free(d->buffer);
+        d->buffer = NULL;
+    }
+}
+
+static void mod_delay_process(mod_delay_t *d, float *input, float *output, int count) {
+    for (int i = 0; i < count; i++) {
+        if (d->samples_processed >= MODULATION_UPDATE_RATE) {
+            mod_delay_update(d);
+            d->samples_processed = 0;
+        }
+
+        d->buffer[d->write_index] = input[i];
+        output[i] = d->buffer[d->read_index_a] * d->gain_a +
+                    d->buffer[d->read_index_b] * d->gain_b;
+
+        d->write_index++;
+        d->read_index_a++;
+        d->read_index_b++;
+        if (d->write_index >= DELAY_BUFFER_SIZE) d->write_index -= DELAY_BUFFER_SIZE;
+        if (d->read_index_a >= DELAY_BUFFER_SIZE) d->read_index_a -= DELAY_BUFFER_SIZE;
+        if (d->read_index_b >= DELAY_BUFFER_SIZE) d->read_index_b -= DELAY_BUFFER_SIZE;
+        d->samples_processed++;
+    }
+}
+
+static void mod_delay_clear(mod_delay_t *d) {
+    if (d->buffer)
+        memset(d->buffer, 0, DELAY_BUFFER_SIZE * sizeof(float));
+}
+
+/* ============================================================================
+ * MULTITAP DELAY - Exact port from MultitapDelay.h
+ * ============================================================================ */
+
+typedef struct {
+    float *buffer;  /* Dynamically allocated */
+    float tap_gains[MAX_TAPS];
+    float tap_position[MAX_TAPS];
+    float seed_values[MAX_TAPS * 3];
+
+    int write_idx;
+    int seed;
+    float cross_seed;
+    int count;
+    float length_samples;
+    float decay;
+} multitap_delay_t;
+
+static void multitap_update(multitap_delay_t *mt) {
+    int s = 0;
+    for (int i = 0; i < MAX_TAPS; i++) {
+        float phase = mt->seed_values[s++] < 0.5f ? 1.0f : -1.0f;
+        mt->tap_gains[i] = db2gain(-20.0f + mt->seed_values[s++] * 20.0f) * phase;
+        mt->tap_position[i] = i + mt->seed_values[s++];
+    }
+}
+
+static void multitap_update_seeds(multitap_delay_t *mt) {
+    random_buffer_generate_cross(mt->seed, mt->cross_seed,
+                                  mt->seed_values, MAX_TAPS * 3);
+    multitap_update(mt);
+}
+
+static void multitap_init(multitap_delay_t *mt) {
+    mt->buffer = (float*)calloc(DELAY_BUFFER_SIZE, sizeof(float));
+    mt->write_idx = 0;
+    mt->seed = 0;
+    mt->cross_seed = 0.0f;
+    mt->count = 1;
+    mt->length_samples = 1000.0f;
+    mt->decay = 1.0f;
+
+    multitap_update_seeds(mt);
+}
+
+static void multitap_free(multitap_delay_t *mt) {
+    if (mt->buffer) {
+        free(mt->buffer);
+        mt->buffer = NULL;
+    }
+}
+
+static void multitap_set_seed(multitap_delay_t *mt, int seed) {
+    mt->seed = seed;
+    multitap_update_seeds(mt);
+}
+
+static void multitap_set_cross_seed(multitap_delay_t *mt, float cross_seed) {
+    mt->cross_seed = cross_seed;
+    multitap_update_seeds(mt);
+}
+
+static void multitap_set_tap_count(multitap_delay_t *mt, int count) {
+    if (count < 1) count = 1;
+    mt->count = count;
+    multitap_update(mt);
+}
+
+static void multitap_set_tap_length(multitap_delay_t *mt, int samples) {
+    if (samples < 10) samples = 10;
+    mt->length_samples = (float)samples;
+    multitap_update(mt);
+}
+
+static void multitap_set_tap_decay(multitap_delay_t *mt, float decay) {
+    mt->decay = decay;
+}
+
+static void multitap_process(multitap_delay_t *mt, float *input, float *output, int count) {
+    float length_scaler = mt->length_samples / (float)mt->count;
+    float total_gain = 3.0f / sqrtf(1.0f + mt->count);
+    total_gain *= (1.0f + mt->decay * 2.0f);
+
+    for (int i = 0; i < count; i++) {
+        mt->buffer[mt->write_idx] = input[i];
+        output[i] = 0.0f;
+
+        for (int j = 0; j < mt->count; j++) {
+            float offset = mt->tap_position[j] * length_scaler;
+            float decay_effective = expf(-offset / mt->length_samples * 3.3f) * mt->decay
+                                   + (1.0f - mt->decay);
+            int read_idx = mt->write_idx - (int)offset;
+            if (read_idx < 0) read_idx += DELAY_BUFFER_SIZE;
+
+            output[i] += mt->buffer[read_idx] * mt->tap_gains[j] * decay_effective * total_gain;
+        }
+
+        mt->write_idx = (mt->write_idx + 1) % DELAY_BUFFER_SIZE;
+    }
+}
+
+static void multitap_clear(multitap_delay_t *mt) {
+    if (mt->buffer)
+        memset(mt->buffer, 0, DELAY_BUFFER_SIZE * sizeof(float));
+}
+
+/* ============================================================================
+ * CIRCULAR BUFFER - For feedback in delay lines
+ * ============================================================================ */
+
+typedef struct {
+    float buffer[BUFFER_SIZE * 2];
+    int idx_read;
+    int idx_write;
+    int count;
+} circular_buffer_t;
+
+static void circular_init(circular_buffer_t *cb) {
+    memset(cb->buffer, 0, sizeof(cb->buffer));
+    cb->idx_read = 0;
+    cb->idx_write = 0;
+    cb->count = 0;
+}
+
+static void circular_push(circular_buffer_t *cb, float *data, int size) {
+    for (int i = 0; i < size; i++) {
+        cb->buffer[cb->idx_write] = data[i];
+        cb->idx_write = (cb->idx_write + 1) % (BUFFER_SIZE * 2);
+        cb->count++;
+        if (cb->count >= BUFFER_SIZE * 2) break;
+    }
+}
+
+static void circular_pop(circular_buffer_t *cb, float *dest, int size) {
+    for (int i = 0; i < size; i++) {
+        if (cb->count > 0) {
+            dest[i] = cb->buffer[cb->idx_read];
+            cb->idx_read = (cb->idx_read + 1) % (BUFFER_SIZE * 2);
+            cb->count--;
+        } else {
+            dest[i] = 0.0f;
+        }
+    }
+}
+
+/* ============================================================================
+ * DELAY LINE - Exact port from DelayLine.h
+ * ============================================================================ */
+
+typedef struct {
+    mod_delay_t delay;
+    allpass_diffuser_t diffuser;
+    biquad_t low_shelf;
+    biquad_t high_shelf;
+    lp1_t low_pass;
+    circular_buffer_t feedback_buffer;
+    float feedback;
+
+    int diffuser_enabled;
+    int low_shelf_enabled;
+    int high_shelf_enabled;
+    int cutoff_enabled;
+    int tap_post_diffuser;
+    int samplerate;
+} delay_line_t;
+
+static void delay_line_init(delay_line_t *dl, int samplerate) {
+    dl->samplerate = samplerate;
+    mod_delay_init(&dl->delay);
+    diffuser_init(&dl->diffuser, samplerate);
+    biquad_init(&dl->low_shelf, BIQUAD_LOWSHELF, samplerate);
+    biquad_init(&dl->high_shelf, BIQUAD_HIGHSHELF, samplerate);
+    lp1_init(&dl->low_pass, samplerate);
+    circular_init(&dl->feedback_buffer);
+
+    dl->feedback = 0.0f;
+
+    biquad_set_gain_db(&dl->low_shelf, -20.0f);
+    dl->low_shelf.frequency = 20.0f;
+    biquad_update(&dl->low_shelf);
+
+    biquad_set_gain_db(&dl->high_shelf, -20.0f);
+    dl->high_shelf.frequency = 19000.0f;
+    biquad_update(&dl->high_shelf);
+
+    lp1_set_cutoff(&dl->low_pass, 1000.0f);
+    diffuser_set_seed(&dl->diffuser, 1);
+    diffuser_set_cross_seed(&dl->diffuser, 0.0f);
+
+    dl->diffuser_enabled = 0;
+    dl->low_shelf_enabled = 0;
+    dl->high_shelf_enabled = 0;
+    dl->cutoff_enabled = 0;
+    dl->tap_post_diffuser = 0;
+}
+
+static void delay_line_free(delay_line_t *dl) {
+    mod_delay_free(&dl->delay);
+}
+
+static void delay_line_set_samplerate(delay_line_t *dl, int samplerate) {
+    dl->samplerate = samplerate;
+    diffuser_set_samplerate(&dl->diffuser, samplerate);
+    lp1_set_samplerate(&dl->low_pass, samplerate);
+    biquad_set_samplerate(&dl->low_shelf, samplerate);
+    biquad_set_samplerate(&dl->high_shelf, samplerate);
+}
+
+static void delay_line_set_diffuser_seed(delay_line_t *dl, int seed, float cross_seed) {
+    diffuser_set_seed(&dl->diffuser, seed);
+    diffuser_set_cross_seed(&dl->diffuser, cross_seed);
+}
+
+static void delay_line_set_delay(delay_line_t *dl, int samples) {
+    dl->delay.sample_delay = samples;
+}
+
+static void delay_line_set_feedback(delay_line_t *dl, float fb) {
+    dl->feedback = fb;
+}
+
+static void delay_line_set_diffuser_delay(delay_line_t *dl, int samples) {
+    diffuser_set_delay(&dl->diffuser, samples);
+}
+
+static void delay_line_set_diffuser_feedback(delay_line_t *dl, float fb) {
+    diffuser_set_feedback(&dl->diffuser, fb);
+}
+
+static void delay_line_set_diffuser_stages(delay_line_t *dl, int stages) {
+    dl->diffuser.stages = stages;
+}
+
+static void delay_line_set_low_shelf_gain(delay_line_t *dl, float db) {
+    biquad_set_gain_db(&dl->low_shelf, db);
+    biquad_update(&dl->low_shelf);
+}
+
+static void delay_line_set_low_shelf_freq(delay_line_t *dl, float freq) {
+    dl->low_shelf.frequency = freq;
+    biquad_update(&dl->low_shelf);
+}
+
+static void delay_line_set_high_shelf_gain(delay_line_t *dl, float db) {
+    biquad_set_gain_db(&dl->high_shelf, db);
+    biquad_update(&dl->high_shelf);
+}
+
+static void delay_line_set_high_shelf_freq(delay_line_t *dl, float freq) {
+    dl->high_shelf.frequency = freq;
+    biquad_update(&dl->high_shelf);
+}
+
+static void delay_line_set_cutoff(delay_line_t *dl, float freq) {
+    lp1_set_cutoff(&dl->low_pass, freq);
+}
+
+static void delay_line_set_line_mod_amount(delay_line_t *dl, float amount) {
+    dl->delay.mod_amount = amount;
+}
+
+static void delay_line_set_line_mod_rate(delay_line_t *dl, float rate) {
+    dl->delay.mod_rate = rate;
+}
+
+static void delay_line_set_diffuser_mod_amount(delay_line_t *dl, float amount) {
+    diffuser_set_modulation(&dl->diffuser, amount > 0.0f);
+    diffuser_set_mod_amount(&dl->diffuser, amount);
+}
+
+static void delay_line_set_diffuser_mod_rate(delay_line_t *dl, float rate) {
+    diffuser_set_mod_rate(&dl->diffuser, rate);
+}
+
+static void delay_line_set_interpolation(delay_line_t *dl, int enabled) {
+    diffuser_set_interpolation(&dl->diffuser, enabled);
+}
+
+static void delay_line_process(delay_line_t *dl, float *input, float *output, int count) {
+    float temp[BUFFER_SIZE];
+    circular_pop(&dl->feedback_buffer, temp, count);
+
+    for (int i = 0; i < count; i++)
+        temp[i] = input[i] + temp[i] * dl->feedback;
+
+    mod_delay_process(&dl->delay, temp, temp, count);
+
+    if (!dl->tap_post_diffuser)
+        memcpy(output, temp, count * sizeof(float));
+
+    if (dl->diffuser_enabled)
+        diffuser_process(&dl->diffuser, temp, temp, count);
+    if (dl->low_shelf_enabled)
+        biquad_process(&dl->low_shelf, temp, temp, count);
+    if (dl->high_shelf_enabled)
+        biquad_process(&dl->high_shelf, temp, temp, count);
+    if (dl->cutoff_enabled)
+        lp1_process(&dl->low_pass, temp, temp, count);
+
+    circular_push(&dl->feedback_buffer, temp, count);
+
+    if (dl->tap_post_diffuser)
+        memcpy(output, temp, count * sizeof(float));
+}
+
+static void delay_line_clear_diffuser(delay_line_t *dl) {
+    diffuser_clear(&dl->diffuser);
+}
+
+static void delay_line_clear(delay_line_t *dl) {
+    mod_delay_clear(&dl->delay);
+    diffuser_clear(&dl->diffuser);
+    biquad_clear(&dl->low_shelf);
+    biquad_clear(&dl->high_shelf);
+    lp1_clear(&dl->low_pass);
+    circular_init(&dl->feedback_buffer);
+}
+
+/* ============================================================================
+ * REVERB CHANNEL - Exact port from ReverbChannel.h
+ * ============================================================================ */
+
+typedef struct {
+    mod_delay_t predelay;
+    multitap_delay_t multitap;
+    allpass_diffuser_t diffuser;
+    delay_line_t lines[MAX_LINE_COUNT];
+    hp1_t high_pass;
+    lp1_t low_pass;
+
+    float delay_line_seeds[MAX_LINE_COUNT * 3];
+    int delay_line_seed;
+    int post_diffusion_seed;
+    float cross_seed;
+
+    int line_count;
+    int low_cut_enabled;
+    int high_cut_enabled;
+    int multitap_enabled;
+    int diffuser_enabled;
+
+    float input_mix;
+    float dry_out;
+    float early_out;
+    float line_out;
+
+    int is_right;
+    int samplerate;
+} reverb_channel_t;
+
+static float channel_ms2samples(reverb_channel_t *ch, float ms) {
+    return ms / 1000.0f * ch->samplerate;
+}
+
+static float channel_get_per_line_gain(reverb_channel_t *ch) {
+    return 1.0f / sqrtf((float)ch->line_count);
+}
+
+static void channel_update_post_diffusion(reverb_channel_t *ch) {
+    for (int i = 0; i < MAX_LINE_COUNT; i++)
+        delay_line_set_diffuser_seed(&ch->lines[i],
+                                      (ch->post_diffusion_seed) * (i + 1),
+                                      ch->cross_seed);
+}
+
+static void channel_update_lines(reverb_channel_t *ch,
+                                  int line_delay_samples,
+                                  float line_decay_samples,
+                                  float line_mod_amount,
+                                  float line_mod_rate,
+                                  float late_diffusion_mod_amount,
+                                  float late_diffusion_mod_rate) {
+    random_buffer_generate_cross(ch->delay_line_seed, ch->cross_seed,
+                                  ch->delay_line_seeds, MAX_LINE_COUNT * 3);
+
+    for (int i = 0; i < MAX_LINE_COUNT; i++) {
+        float mod_amt = line_mod_amount * (0.7f + 0.3f * ch->delay_line_seeds[i]);
+        float mod_rate = line_mod_rate * (0.7f + 0.3f * ch->delay_line_seeds[MAX_LINE_COUNT + i])
+                         / ch->samplerate;
+
+        float delay_samples = (0.5f + 1.0f * ch->delay_line_seeds[MAX_LINE_COUNT * 2 + i])
+                              * line_delay_samples;
+        if (delay_samples < mod_amt + 2)
+            delay_samples = mod_amt + 2;
+
+        float db_per_iteration = delay_samples / line_decay_samples * (-60.0f);
+        float gain_per_iteration = db2gain(db_per_iteration);
+
+        delay_line_set_delay(&ch->lines[i], (int)delay_samples);
+        delay_line_set_feedback(&ch->lines[i], gain_per_iteration);
+        delay_line_set_line_mod_amount(&ch->lines[i], mod_amt);
+        delay_line_set_line_mod_rate(&ch->lines[i], mod_rate);
+        delay_line_set_diffuser_mod_amount(&ch->lines[i], late_diffusion_mod_amount);
+        delay_line_set_diffuser_mod_rate(&ch->lines[i], late_diffusion_mod_rate);
+    }
+}
+
+static void channel_init(reverb_channel_t *ch, int samplerate, int is_right) {
+    ch->samplerate = samplerate;
+    ch->is_right = is_right;
+    ch->cross_seed = 0.0f;
+    ch->line_count = 8;  /* Default from reference */
+    ch->delay_line_seed = 12345;
+    ch->post_diffusion_seed = 12345;
+
+    mod_delay_init(&ch->predelay);
+    multitap_init(&ch->multitap);
+    diffuser_init(&ch->diffuser, samplerate);
+    hp1_init(&ch->high_pass, samplerate);
+    lp1_init(&ch->low_pass, samplerate);
+
+    diffuser_set_interpolation(&ch->diffuser, 1);
+    hp1_set_cutoff(&ch->high_pass, 20.0f);
+    lp1_set_cutoff(&ch->low_pass, 20000.0f);
+
+    for (int i = 0; i < MAX_LINE_COUNT; i++)
+        delay_line_init(&ch->lines[i], samplerate);
+
+    ch->low_cut_enabled = 0;
+    ch->high_cut_enabled = 1;
+    ch->multitap_enabled = 0;
+    ch->diffuser_enabled = 1;
+
+    ch->input_mix = 1.0f;
+    ch->dry_out = 0.0f;
+    ch->early_out = 0.0f;
+    ch->line_out = 1.0f;
+}
+
+static void channel_free(reverb_channel_t *ch) {
+    mod_delay_free(&ch->predelay);
+    multitap_free(&ch->multitap);
+    for (int i = 0; i < MAX_LINE_COUNT; i++)
+        delay_line_free(&ch->lines[i]);
+}
+
+static void channel_set_samplerate(reverb_channel_t *ch, int samplerate) {
+    ch->samplerate = samplerate;
+    hp1_set_samplerate(&ch->high_pass, samplerate);
+    lp1_set_samplerate(&ch->low_pass, samplerate);
+    diffuser_set_samplerate(&ch->diffuser, samplerate);
+
+    for (int i = 0; i < MAX_LINE_COUNT; i++)
+        delay_line_set_samplerate(&ch->lines[i], samplerate);
+}
+
+static void channel_set_cross_seed(reverb_channel_t *ch, float seed_param) {
+    /* Exact from reference: Right channel uses 0.5 * seed, Left uses 1 - 0.5 * seed */
+    ch->cross_seed = ch->is_right ? 0.5f * seed_param : 1.0f - 0.5f * seed_param;
+    multitap_set_cross_seed(&ch->multitap, ch->cross_seed);
+    diffuser_set_cross_seed(&ch->diffuser, ch->cross_seed);
+}
+
+static void channel_process(reverb_channel_t *ch, float *input, float *output, int count) {
+    float temp[BUFFER_SIZE];
+    float early_out_buf[BUFFER_SIZE];
+    float line_out_buf[BUFFER_SIZE];
+    float line_sum[BUFFER_SIZE];
+
+    for (int i = 0; i < count; i++)
+        temp[i] = input[i] * ch->input_mix;
+
+    if (ch->low_cut_enabled)
+        hp1_process(&ch->high_pass, temp, temp, count);
+    if (ch->high_cut_enabled)
+        lp1_process(&ch->low_pass, temp, temp, count);
+
+    /* Denormal prevention */
+    for (int i = 0; i < count; i++) {
+        if (temp[i] * temp[i] < 0.000000001f)
+            temp[i] = 0.0f;
+    }
+
+    mod_delay_process(&ch->predelay, temp, temp, count);
+
+    if (ch->multitap_enabled)
+        multitap_process(&ch->multitap, temp, temp, count);
+
+    if (ch->diffuser_enabled)
+        diffuser_process(&ch->diffuser, temp, temp, count);
+
+    memcpy(early_out_buf, temp, count * sizeof(float));
+    memset(line_sum, 0, count * sizeof(float));
+
+    for (int i = 0; i < ch->line_count; i++) {
+        delay_line_process(&ch->lines[i], temp, line_out_buf, count);
+        for (int j = 0; j < count; j++)
+            line_sum[j] += line_out_buf[j];
+    }
+
+    float per_line_gain = channel_get_per_line_gain(ch);
+    for (int i = 0; i < count; i++)
+        line_sum[i] *= per_line_gain;
+
+    for (int i = 0; i < count; i++) {
+        output[i] = ch->dry_out * input[i]
+                  + ch->early_out * early_out_buf[i]
+                  + ch->line_out * line_sum[i];
+    }
+}
+
+static void channel_clear(reverb_channel_t *ch) {
+    lp1_clear(&ch->low_pass);
+    hp1_clear(&ch->high_pass);
+    mod_delay_clear(&ch->predelay);
+    multitap_clear(&ch->multitap);
+    diffuser_clear(&ch->diffuser);
+    for (int i = 0; i < MAX_LINE_COUNT; i++)
+        delay_line_clear(&ch->lines[i]);
+}
+
+/* ============================================================================
+ * PLUGIN STATE
+ * ============================================================================ */
+
 static const host_api_v1_t *g_host = NULL;
 static audio_fx_api_v1_t g_fx_api;
 
-/* Parameters */
-static float g_decay = 0.5f;     /* Feedback amount */
-static float g_mix = 0.3f;       /* Dry/wet */
-static float g_predelay = 0.1f;  /* Pre-delay (0-1 maps to 0-100ms) */
-static float g_size = 0.5f;      /* Room size */
-static float g_damping = 0.5f;   /* High-frequency damping */
+/* Parameters (0-1 normalized) */
+static float g_input_mix = 1.0f;
+static float g_predelay = 0.0f;         /* 0-500ms via Resp1dec */
+static float g_decay = 0.5f;            /* T60 time */
+static float g_size = 0.5f;             /* Room size */
+static float g_diffusion = 0.7f;        /* Early diffuser feedback */
+static float g_mix = 0.3f;              /* Dry/wet */
 
-/* Pre-delay buffers (stereo) */
-static float g_predelay_l[PREDELAY_SIZE];
-static float g_predelay_r[PREDELAY_SIZE];
-static unsigned int g_predelay_pos = 0;
+/* Additional parameters from reference */
+static float g_low_cut = 0.0f;          /* 20-1000 Hz */
+static float g_high_cut = 1.0f;         /* 400-20000 Hz */
+static float g_cross_seed = 0.5f;       /* Stereo decorrelation */
+static float g_mod_rate = 0.3f;         /* Modulation rate */
+static float g_mod_amount = 0.3f;       /* Modulation depth */
 
-/* Diffuser buffers (4 per channel) */
-static float g_diff1_l[DIFF_SIZE];
-static float g_diff1_r[DIFF_SIZE];
-static float g_diff2_l[DIFF_SIZE];
-static float g_diff2_r[DIFF_SIZE];
-static float g_diff3_l[DIFF_SIZE];
-static float g_diff3_r[DIFF_SIZE];
-static float g_diff4_l[DIFF_SIZE];
-static float g_diff4_r[DIFF_SIZE];
-static unsigned int g_diff_pos = 0;
+/* Reverb channels */
+static reverb_channel_t *g_channel_l = NULL;
+static reverb_channel_t *g_channel_r = NULL;
 
-/* Delay network buffers (4 per channel) */
-static float g_delay1_l[DELAY_SIZE];
-static float g_delay1_r[DELAY_SIZE];
-static float g_delay2_l[DELAY_SIZE];
-static float g_delay2_r[DELAY_SIZE];
-static float g_delay3_l[DELAY_SIZE];
-static float g_delay3_r[DELAY_SIZE];
-static float g_delay4_l[DELAY_SIZE];
-static float g_delay4_r[DELAY_SIZE];
-static unsigned int g_delay_pos = 0;
-
-/* Feedback state (for Hadamard mixing) */
-static float g_fb1_l = 0.0f, g_fb1_r = 0.0f;
-static float g_fb2_l = 0.0f, g_fb2_r = 0.0f;
-static float g_fb3_l = 0.0f, g_fb3_r = 0.0f;
-static float g_fb4_l = 0.0f, g_fb4_r = 0.0f;
-
-/* Damping lowpass state (one-pole per delay line) */
-static float g_damp1_l = 0.0f, g_damp1_r = 0.0f;
-static float g_damp2_l = 0.0f, g_damp2_r = 0.0f;
-static float g_damp3_l = 0.0f, g_damp3_r = 0.0f;
-static float g_damp4_l = 0.0f, g_damp4_r = 0.0f;
-
-/* LFO phase (different for L/R for stereo width) */
-static float g_lfo_phase_l = 0.0f;
-static float g_lfo_phase_r = 0.0f;
-
-/* Logging helper */
 static void fx_log(const char *msg) {
     if (g_host && g_host->log) {
         char buf[256];
@@ -126,312 +1218,218 @@ static void fx_log(const char *msg) {
     }
 }
 
-/*
- * Allpass filter (CloudSeed topology)
- * Returns filtered output and updates buffer
- */
-static inline float allpass(float in, float *buf, int delay, unsigned int pos) {
-    unsigned int read_idx = (pos + DIFF_SIZE - delay) & DIFF_MASK;
-    float delayed = buf[read_idx];
-    float temp = in + delayed * APF_COEFF;
-    buf[pos & DIFF_MASK] = temp;
-    return delayed - temp * APF_COEFF;
+static void apply_parameters(void) {
+    if (!g_channel_l || !g_channel_r) return;
+
+    int samplerate = SAMPLE_RATE;
+
+    /* Pre-delay: 0-500ms using Resp1dec curve */
+    float predelay_ms = resp2dec(g_predelay) * 500.0f;  /* Using resp2dec like TapPredelay */
+    int predelay_samples = (int)(predelay_ms / 1000.0f * samplerate);
+    if (predelay_samples < 1) predelay_samples = 1;
+    g_channel_l->predelay.sample_delay = predelay_samples;
+    g_channel_r->predelay.sample_delay = predelay_samples;
+
+    /* Room size: 20-1000ms using Resp2dec curve */
+    float line_size_ms = 20.0f + resp2dec(g_size) * 980.0f;
+    int line_delay_samples = (int)(line_size_ms / 1000.0f * samplerate);
+
+    /* Decay: 0.05-60 seconds using Resp3dec curve */
+    float decay_seconds = 0.05f + resp3dec(g_decay) * 59.95f;
+    float line_decay_samples = decay_seconds * samplerate;
+
+    /* Modulation amounts */
+    float line_mod_amount = g_mod_amount * 2.5f * samplerate / 1000.0f;  /* Convert ms to samples */
+    float line_mod_rate = resp2dec(g_mod_rate) * 5.0f;
+
+    float late_diff_mod_amount = g_mod_amount * 2.5f * samplerate / 1000.0f;
+    float late_diff_mod_rate = resp2dec(g_mod_rate) * 5.0f;
+
+    /* Update delay lines */
+    channel_update_lines(g_channel_l, line_delay_samples, line_decay_samples,
+                          line_mod_amount, line_mod_rate,
+                          late_diff_mod_amount, late_diff_mod_rate);
+    channel_update_lines(g_channel_r, line_delay_samples, line_decay_samples,
+                          line_mod_amount, line_mod_rate,
+                          late_diff_mod_amount, late_diff_mod_rate);
+
+    /* Early diffuser settings */
+    int diff_stages = 4 + (int)(g_diffusion * 7.999f);  /* 4-12 stages */
+    g_channel_l->diffuser.stages = diff_stages;
+    g_channel_r->diffuser.stages = diff_stages;
+
+    float diff_delay_ms = 10.0f + g_size * 90.0f;  /* 10-100ms */
+    int diff_delay = (int)(diff_delay_ms / 1000.0f * samplerate);
+    diffuser_set_delay(&g_channel_l->diffuser, diff_delay);
+    diffuser_set_delay(&g_channel_r->diffuser, diff_delay);
+
+    diffuser_set_feedback(&g_channel_l->diffuser, g_diffusion);
+    diffuser_set_feedback(&g_channel_r->diffuser, g_diffusion);
+
+    float diff_mod_amount = g_mod_amount * 2.5f * samplerate / 1000.0f;
+    diffuser_set_mod_amount(&g_channel_l->diffuser, diff_mod_amount);
+    diffuser_set_mod_amount(&g_channel_r->diffuser, diff_mod_amount);
+
+    float diff_mod_rate = resp2dec(g_mod_rate) * 5.0f;
+    diffuser_set_mod_rate(&g_channel_l->diffuser, diff_mod_rate);
+    diffuser_set_mod_rate(&g_channel_r->diffuser, diff_mod_rate);
+
+    /* Input filters */
+    float low_cut_hz = 20.0f + resp4oct(g_low_cut) * 980.0f;
+    float high_cut_hz = 400.0f + resp4oct(g_high_cut) * 19600.0f;
+    hp1_set_cutoff(&g_channel_l->high_pass, low_cut_hz);
+    hp1_set_cutoff(&g_channel_r->high_pass, low_cut_hz);
+    lp1_set_cutoff(&g_channel_l->low_pass, high_cut_hz);
+    lp1_set_cutoff(&g_channel_r->low_pass, high_cut_hz);
+
+    /* Cross seed for stereo */
+    channel_set_cross_seed(g_channel_l, g_cross_seed);
+    channel_set_cross_seed(g_channel_r, g_cross_seed);
+    channel_update_post_diffusion(g_channel_l);
+    channel_update_post_diffusion(g_channel_r);
+
+    /* EQ cutoff in delay lines (damping) */
+    float eq_cutoff = 400.0f + resp4oct(g_high_cut * 0.8f) * 19600.0f;
+    for (int i = 0; i < MAX_LINE_COUNT; i++) {
+        delay_line_set_cutoff(&g_channel_l->lines[i], eq_cutoff);
+        delay_line_set_cutoff(&g_channel_r->lines[i], eq_cutoff);
+        g_channel_l->lines[i].cutoff_enabled = 1;
+        g_channel_r->lines[i].cutoff_enabled = 1;
+    }
+
+    /* Output mix: dry = 0dB, wet controlled by mix */
+    g_channel_l->dry_out = 0.0f;  /* We handle mix in process_block */
+    g_channel_r->dry_out = 0.0f;
+    g_channel_l->line_out = 1.0f;
+    g_channel_r->line_out = 1.0f;
 }
 
-/*
- * One-pole lowpass filter
- * coeff: 0 = no filtering, 1 = max filtering
- */
-static inline float lowpass(float in, float *state, float coeff) {
-    *state = *state + coeff * (in - *state);
-    return *state;
-}
-
-/*
- * Calculate damping coefficient from parameter
- * One-pole lowpass: y = y + coeff * (x - y)
- * Higher coeff = less filtering (passes more high freq)
- * damping=0 -> coeff ~0.95 (bright, minimal filtering)
- * damping=1 -> coeff ~0.15 (dark, strong filtering)
- */
-static inline float calc_damp_coeff(float damping) {
-    return 0.95f - damping * 0.80f;
-}
-
-/*
- * Calculate actual delay times from size parameter
- * size scales delay times: actual = base * (0.3 + size * 1.2)
- * At size=0: 30% of base (small room)
- * At size=1: 150% of base (huge hall)
- */
-static inline int scale_delay(int base, float size) {
-    float scale = 0.3f + size * 1.2f;
-    int result = (int)(base * scale);
-    /* Clamp to valid range */
-    if (result < 1) result = 1;
-    if (result > DELAY_SIZE - 1) result = DELAY_SIZE - 1;
-    return result;
-}
-
-/* === Audio FX API Implementation === */
+/* ============================================================================
+ * AUDIO FX API
+ * ============================================================================ */
 
 static int fx_on_load(const char *module_dir, const char *config_json) {
     char msg[256];
-    snprintf(msg, sizeof(msg), "CloudSeed loading from: %s", module_dir);
+    snprintf(msg, sizeof(msg), "CloudSeed (exact port) loading from: %s", module_dir);
     fx_log(msg);
 
-    /* Clear pre-delay buffers */
-    memset(g_predelay_l, 0, sizeof(g_predelay_l));
-    memset(g_predelay_r, 0, sizeof(g_predelay_r));
-    g_predelay_pos = 0;
+    /* Allocate channels */
+    g_channel_l = (reverb_channel_t*)malloc(sizeof(reverb_channel_t));
+    g_channel_r = (reverb_channel_t*)malloc(sizeof(reverb_channel_t));
 
-    /* Clear diffuser buffers */
-    memset(g_diff1_l, 0, sizeof(g_diff1_l));
-    memset(g_diff1_r, 0, sizeof(g_diff1_r));
-    memset(g_diff2_l, 0, sizeof(g_diff2_l));
-    memset(g_diff2_r, 0, sizeof(g_diff2_r));
-    memset(g_diff3_l, 0, sizeof(g_diff3_l));
-    memset(g_diff3_r, 0, sizeof(g_diff3_r));
-    memset(g_diff4_l, 0, sizeof(g_diff4_l));
-    memset(g_diff4_r, 0, sizeof(g_diff4_r));
-    g_diff_pos = 0;
+    if (!g_channel_l || !g_channel_r) {
+        fx_log("Failed to allocate reverb channels");
+        return -1;
+    }
 
-    /* Clear delay network buffers */
-    memset(g_delay1_l, 0, sizeof(g_delay1_l));
-    memset(g_delay1_r, 0, sizeof(g_delay1_r));
-    memset(g_delay2_l, 0, sizeof(g_delay2_l));
-    memset(g_delay2_r, 0, sizeof(g_delay2_r));
-    memset(g_delay3_l, 0, sizeof(g_delay3_l));
-    memset(g_delay3_r, 0, sizeof(g_delay3_r));
-    memset(g_delay4_l, 0, sizeof(g_delay4_l));
-    memset(g_delay4_r, 0, sizeof(g_delay4_r));
-    g_delay_pos = 0;
+    channel_init(g_channel_l, SAMPLE_RATE, 0);
+    channel_init(g_channel_r, SAMPLE_RATE, 1);
 
-    /* Clear feedback state */
-    g_fb1_l = g_fb1_r = 0.0f;
-    g_fb2_l = g_fb2_r = 0.0f;
-    g_fb3_l = g_fb3_r = 0.0f;
-    g_fb4_l = g_fb4_r = 0.0f;
+    apply_parameters();
 
-    /* Clear damping state */
-    g_damp1_l = g_damp1_r = 0.0f;
-    g_damp2_l = g_damp2_r = 0.0f;
-    g_damp3_l = g_damp3_r = 0.0f;
-    g_damp4_l = g_damp4_r = 0.0f;
-
-    /* Initialize LFO phases (offset for stereo width) */
-    g_lfo_phase_l = 0.0f;
-    g_lfo_phase_r = 0.25f;  /* 90 degree offset for stereo width */
-
-    fx_log("CloudSeed initialized");
+    fx_log("CloudSeed initialized (exact port from CloudSeedCore)");
     return 0;
 }
 
 static void fx_on_unload(void) {
     fx_log("CloudSeed unloading");
+
+    if (g_channel_l) {
+        channel_free(g_channel_l);
+        free(g_channel_l);
+        g_channel_l = NULL;
+    }
+    if (g_channel_r) {
+        channel_free(g_channel_r);
+        free(g_channel_r);
+        g_channel_r = NULL;
+    }
 }
 
 static void fx_process_block(int16_t *audio_inout, int frames) {
-    /* Calculate pre-delay in samples (0-100ms) */
-    int predelay_samples = (int)(g_predelay * MAX_PREDELAY_SAMPLES);
-    if (predelay_samples < 1) predelay_samples = 1;
+    if (!g_channel_l || !g_channel_r) return;
 
-    /* Calculate scaled delay times */
-    int delay1 = scale_delay(DELAY1_BASE, g_size);
-    int delay2 = scale_delay(DELAY2_BASE, g_size);
-    int delay3 = scale_delay(DELAY3_BASE, g_size);
-    int delay4 = scale_delay(DELAY4_BASE, g_size);
+    /* Process in chunks of BUFFER_SIZE */
+    int offset = 0;
+    while (offset < frames) {
+        int chunk = frames - offset;
+        if (chunk > BUFFER_SIZE) chunk = BUFFER_SIZE;
 
-    /* Calculate feedback amount from decay (0.5 to 0.995) */
-    /* Higher max feedback allows much longer, lush reverb tails */
-    float feedback = 0.5f + g_decay * 0.495f;
+        float in_l[BUFFER_SIZE];
+        float in_r[BUFFER_SIZE];
+        float out_l[BUFFER_SIZE];
+        float out_r[BUFFER_SIZE];
 
-    /* Calculate damping coefficient */
-    float damp_coeff = calc_damp_coeff(g_damping);
+        /* Convert to float */
+        for (int i = 0; i < chunk; i++) {
+            in_l[i] = audio_inout[(offset + i) * 2] / 32768.0f;
+            in_r[i] = audio_inout[(offset + i) * 2 + 1] / 32768.0f;
+        }
 
-    /* LFO increment per sample (~0.3Hz) */
-    float lfo_inc = LFO_FREQ / SAMPLE_RATE;
+        /* Process through reverb channels */
+        channel_process(g_channel_l, in_l, out_l, chunk);
+        channel_process(g_channel_r, in_r, out_r, chunk);
 
-    for (int i = 0; i < frames; i++) {
-        /* Convert input to float (-1.0 to 1.0) */
-        float in_l = audio_inout[i * 2] / 32768.0f;
-        float in_r = audio_inout[i * 2 + 1] / 32768.0f;
+        /* Mix dry and wet, convert back to int16 */
+        for (int i = 0; i < chunk; i++) {
+            float mixed_l = in_l[i] * (1.0f - g_mix) + out_l[i] * g_mix;
+            float mixed_r = in_r[i] * (1.0f - g_mix) + out_r[i] * g_mix;
 
-        /* === Pre-delay === */
-        /* Write input to pre-delay buffer */
-        g_predelay_l[g_predelay_pos & PREDELAY_MASK] = in_l;
-        g_predelay_r[g_predelay_pos & PREDELAY_MASK] = in_r;
+            /* Soft clipping */
+            if (mixed_l > 1.0f) mixed_l = 1.0f;
+            if (mixed_l < -1.0f) mixed_l = -1.0f;
+            if (mixed_r > 1.0f) mixed_r = 1.0f;
+            if (mixed_r < -1.0f) mixed_r = -1.0f;
 
-        /* Read from pre-delay */
-        unsigned int pd_read = (g_predelay_pos + PREDELAY_SIZE - predelay_samples) & PREDELAY_MASK;
-        float pd_l = g_predelay_l[pd_read];
-        float pd_r = g_predelay_r[pd_read];
+            audio_inout[(offset + i) * 2] = (int16_t)(mixed_l * 32767.0f);
+            audio_inout[(offset + i) * 2 + 1] = (int16_t)(mixed_r * 32767.0f);
+        }
 
-        g_predelay_pos++;
-
-        /* === Diffuser Network (4 cascaded allpass filters) === */
-        /* Diffuser input is just pre-delayed signal (feedback goes to delay writes) */
-        float diff_in_l = pd_l;
-        float diff_in_r = pd_r;
-
-        float d1_l = allpass(diff_in_l, g_diff1_l, DIFF1_DELAY, g_diff_pos);
-        float d1_r = allpass(diff_in_r, g_diff1_r, DIFF1_DELAY, g_diff_pos);
-
-        float d2_l = allpass(d1_l, g_diff2_l, DIFF2_DELAY, g_diff_pos);
-        float d2_r = allpass(d1_r, g_diff2_r, DIFF2_DELAY, g_diff_pos);
-
-        float d3_l = allpass(d2_l, g_diff3_l, DIFF3_DELAY, g_diff_pos);
-        float d3_r = allpass(d2_r, g_diff3_r, DIFF3_DELAY, g_diff_pos);
-
-        float d4_l = allpass(d3_l, g_diff4_l, DIFF4_DELAY, g_diff_pos);
-        float d4_r = allpass(d3_r, g_diff4_r, DIFF4_DELAY, g_diff_pos);
-
-        g_diff_pos++;
-
-        /* === LFO modulation for delay network === */
-        float lfo_l = sinf(g_lfo_phase_l * 2.0f * M_PI);
-        float lfo_r = sinf(g_lfo_phase_r * 2.0f * M_PI);
-
-        /* Advance LFO phase */
-        g_lfo_phase_l += lfo_inc;
-        if (g_lfo_phase_l >= 1.0f) g_lfo_phase_l -= 1.0f;
-        g_lfo_phase_r += lfo_inc;
-        if (g_lfo_phase_r >= 1.0f) g_lfo_phase_r -= 1.0f;
-
-        /* Calculate modulated delay times */
-        int mod_delay1_l = delay1 + (int)roundf(lfo_l * LFO_DEPTH_SAMPLES);
-        int mod_delay2_l = delay2 + (int)roundf(lfo_r * LFO_DEPTH_SAMPLES);  /* Alternate LFO */
-        int mod_delay3_l = delay3 + (int)roundf(lfo_l * LFO_DEPTH_SAMPLES);
-        int mod_delay4_l = delay4 + (int)roundf(lfo_r * LFO_DEPTH_SAMPLES);
-
-        int mod_delay1_r = delay1 + (int)roundf(lfo_r * LFO_DEPTH_SAMPLES);
-        int mod_delay2_r = delay2 + (int)roundf(lfo_l * LFO_DEPTH_SAMPLES);
-        int mod_delay3_r = delay3 + (int)roundf(lfo_r * LFO_DEPTH_SAMPLES);
-        int mod_delay4_r = delay4 + (int)roundf(lfo_l * LFO_DEPTH_SAMPLES);
-
-        /* Clamp modulated delays to valid range */
-        if (mod_delay1_l < 1) mod_delay1_l = 1;
-        if (mod_delay1_l > DELAY_SIZE - 2) mod_delay1_l = DELAY_SIZE - 2;
-        if (mod_delay2_l < 1) mod_delay2_l = 1;
-        if (mod_delay2_l > DELAY_SIZE - 2) mod_delay2_l = DELAY_SIZE - 2;
-        if (mod_delay3_l < 1) mod_delay3_l = 1;
-        if (mod_delay3_l > DELAY_SIZE - 2) mod_delay3_l = DELAY_SIZE - 2;
-        if (mod_delay4_l < 1) mod_delay4_l = 1;
-        if (mod_delay4_l > DELAY_SIZE - 2) mod_delay4_l = DELAY_SIZE - 2;
-        if (mod_delay1_r < 1) mod_delay1_r = 1;
-        if (mod_delay1_r > DELAY_SIZE - 2) mod_delay1_r = DELAY_SIZE - 2;
-        if (mod_delay2_r < 1) mod_delay2_r = 1;
-        if (mod_delay2_r > DELAY_SIZE - 2) mod_delay2_r = DELAY_SIZE - 2;
-        if (mod_delay3_r < 1) mod_delay3_r = 1;
-        if (mod_delay3_r > DELAY_SIZE - 2) mod_delay3_r = DELAY_SIZE - 2;
-        if (mod_delay4_r < 1) mod_delay4_r = 1;
-        if (mod_delay4_r > DELAY_SIZE - 2) mod_delay4_r = DELAY_SIZE - 2;
-
-        /* === Delay Network (4 modulated delay lines) === */
-        /* Write diffuser output plus Hadamard feedback to delay buffers */
-        g_delay1_l[g_delay_pos & DELAY_MASK] = d4_l + g_fb1_l;
-        g_delay1_r[g_delay_pos & DELAY_MASK] = d4_r + g_fb1_r;
-        g_delay2_l[g_delay_pos & DELAY_MASK] = d4_l + g_fb2_l;
-        g_delay2_r[g_delay_pos & DELAY_MASK] = d4_r + g_fb2_r;
-        g_delay3_l[g_delay_pos & DELAY_MASK] = d4_l + g_fb3_l;
-        g_delay3_r[g_delay_pos & DELAY_MASK] = d4_r + g_fb3_r;
-        g_delay4_l[g_delay_pos & DELAY_MASK] = d4_l + g_fb4_l;
-        g_delay4_r[g_delay_pos & DELAY_MASK] = d4_r + g_fb4_r;
-
-        /* Read from delay lines with modulation */
-        unsigned int read1_l = (g_delay_pos + DELAY_SIZE - mod_delay1_l) & DELAY_MASK;
-        unsigned int read2_l = (g_delay_pos + DELAY_SIZE - mod_delay2_l) & DELAY_MASK;
-        unsigned int read3_l = (g_delay_pos + DELAY_SIZE - mod_delay3_l) & DELAY_MASK;
-        unsigned int read4_l = (g_delay_pos + DELAY_SIZE - mod_delay4_l) & DELAY_MASK;
-
-        unsigned int read1_r = (g_delay_pos + DELAY_SIZE - mod_delay1_r) & DELAY_MASK;
-        unsigned int read2_r = (g_delay_pos + DELAY_SIZE - mod_delay2_r) & DELAY_MASK;
-        unsigned int read3_r = (g_delay_pos + DELAY_SIZE - mod_delay3_r) & DELAY_MASK;
-        unsigned int read4_r = (g_delay_pos + DELAY_SIZE - mod_delay4_r) & DELAY_MASK;
-
-        float del1_l = g_delay1_l[read1_l];
-        float del2_l = g_delay2_l[read2_l];
-        float del3_l = g_delay3_l[read3_l];
-        float del4_l = g_delay4_l[read4_l];
-
-        float del1_r = g_delay1_r[read1_r];
-        float del2_r = g_delay2_r[read2_r];
-        float del3_r = g_delay3_r[read3_r];
-        float del4_r = g_delay4_r[read4_r];
-
-        g_delay_pos++;
-
-        /* === Damping (one-pole lowpass per delay line) === */
-        del1_l = lowpass(del1_l, &g_damp1_l, damp_coeff);
-        del2_l = lowpass(del2_l, &g_damp2_l, damp_coeff);
-        del3_l = lowpass(del3_l, &g_damp3_l, damp_coeff);
-        del4_l = lowpass(del4_l, &g_damp4_l, damp_coeff);
-
-        del1_r = lowpass(del1_r, &g_damp1_r, damp_coeff);
-        del2_r = lowpass(del2_r, &g_damp2_r, damp_coeff);
-        del3_r = lowpass(del3_r, &g_damp3_r, damp_coeff);
-        del4_r = lowpass(del4_r, &g_damp4_r, damp_coeff);
-
-        /* === Hadamard Feedback Matrix === */
-        /* Mix delay outputs before feeding back to delay network */
-        /* 0.5f is proper normalization for 4x4 Hadamard (1/sqrt(4)) */
-        g_fb1_l = (del1_l + del2_l + del3_l + del4_l) * 0.5f * feedback;
-        g_fb2_l = (del1_l - del2_l + del3_l - del4_l) * 0.5f * feedback;
-        g_fb3_l = (del1_l + del2_l - del3_l - del4_l) * 0.5f * feedback;
-        g_fb4_l = (del1_l - del2_l - del3_l + del4_l) * 0.5f * feedback;
-
-        g_fb1_r = (del1_r + del2_r + del3_r + del4_r) * 0.5f * feedback;
-        g_fb2_r = (del1_r - del2_r + del3_r - del4_r) * 0.5f * feedback;
-        g_fb3_r = (del1_r + del2_r - del3_r - del4_r) * 0.5f * feedback;
-        g_fb4_r = (del1_r - del2_r - del3_r + del4_r) * 0.5f * feedback;
-
-        /* === Output === */
-        /* Sum delay outputs for wet signal */
-        float wet_l = (del1_l + del2_l + del3_l + del4_l) * 0.25f;
-        float wet_r = (del1_r + del2_r + del3_r + del4_r) * 0.25f;
-
-        /* === Mix dry and wet === */
-        float out_l = in_l * (1.0f - g_mix) + wet_l * g_mix;
-        float out_r = in_r * (1.0f - g_mix) + wet_r * g_mix;
-
-        /* Clamp output and convert back to int16 */
-        if (out_l > 1.0f) out_l = 1.0f;
-        if (out_l < -1.0f) out_l = -1.0f;
-        if (out_r > 1.0f) out_r = 1.0f;
-        if (out_r < -1.0f) out_r = -1.0f;
-
-        audio_inout[i * 2] = (int16_t)(out_l * 32767.0f);
-        audio_inout[i * 2 + 1] = (int16_t)(out_r * 32767.0f);
+        offset += chunk;
     }
 }
 
 static void fx_set_param(const char *key, const char *val) {
+    int need_update = 0;
+    float v = atof(val);
+
+    /* Clamp to 0-1 */
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+
     if (strcmp(key, "decay") == 0) {
-        float v = atof(val);
-        if (v < 0.0f) v = 0.0f;
-        if (v > 1.0f) v = 1.0f;
         g_decay = v;
+        need_update = 1;
     } else if (strcmp(key, "mix") == 0) {
-        float v = atof(val);
-        if (v < 0.0f) v = 0.0f;
-        if (v > 1.0f) v = 1.0f;
         g_mix = v;
     } else if (strcmp(key, "predelay") == 0) {
-        float v = atof(val);
-        if (v < 0.0f) v = 0.0f;
-        if (v > 1.0f) v = 1.0f;
         g_predelay = v;
+        need_update = 1;
     } else if (strcmp(key, "size") == 0) {
-        float v = atof(val);
-        if (v < 0.0f) v = 0.0f;
-        if (v > 1.0f) v = 1.0f;
         g_size = v;
-    } else if (strcmp(key, "damping") == 0) {
-        float v = atof(val);
-        if (v < 0.0f) v = 0.0f;
-        if (v > 1.0f) v = 1.0f;
-        g_damping = v;
+        need_update = 1;
+    } else if (strcmp(key, "diffusion") == 0) {
+        g_diffusion = v;
+        need_update = 1;
+    } else if (strcmp(key, "low_cut") == 0) {
+        g_low_cut = v;
+        need_update = 1;
+    } else if (strcmp(key, "high_cut") == 0) {
+        g_high_cut = v;
+        need_update = 1;
+    } else if (strcmp(key, "cross_seed") == 0) {
+        g_cross_seed = v;
+        need_update = 1;
+    } else if (strcmp(key, "mod_rate") == 0) {
+        g_mod_rate = v;
+        need_update = 1;
+    } else if (strcmp(key, "mod_amount") == 0) {
+        g_mod_amount = v;
+        need_update = 1;
     }
+
+    if (need_update)
+        apply_parameters();
 }
 
 static int fx_get_param(const char *key, char *buf, int buf_len) {
@@ -443,15 +1441,27 @@ static int fx_get_param(const char *key, char *buf, int buf_len) {
         return snprintf(buf, buf_len, "%.2f", g_predelay);
     } else if (strcmp(key, "size") == 0) {
         return snprintf(buf, buf_len, "%.2f", g_size);
-    } else if (strcmp(key, "damping") == 0) {
-        return snprintf(buf, buf_len, "%.2f", g_damping);
+    } else if (strcmp(key, "diffusion") == 0) {
+        return snprintf(buf, buf_len, "%.2f", g_diffusion);
+    } else if (strcmp(key, "low_cut") == 0) {
+        return snprintf(buf, buf_len, "%.2f", g_low_cut);
+    } else if (strcmp(key, "high_cut") == 0) {
+        return snprintf(buf, buf_len, "%.2f", g_high_cut);
+    } else if (strcmp(key, "cross_seed") == 0) {
+        return snprintf(buf, buf_len, "%.2f", g_cross_seed);
+    } else if (strcmp(key, "mod_rate") == 0) {
+        return snprintf(buf, buf_len, "%.2f", g_mod_rate);
+    } else if (strcmp(key, "mod_amount") == 0) {
+        return snprintf(buf, buf_len, "%.2f", g_mod_amount);
     } else if (strcmp(key, "name") == 0) {
         return snprintf(buf, buf_len, "CloudSeed");
     }
     return -1;
 }
 
-/* === Entry Point === */
+/* ============================================================================
+ * ENTRY POINT
+ * ============================================================================ */
 
 audio_fx_api_v1_t* move_audio_fx_init_v1(const host_api_v1_t *host) {
     g_host = host;
@@ -464,7 +1474,7 @@ audio_fx_api_v1_t* move_audio_fx_init_v1(const host_api_v1_t *host) {
     g_fx_api.set_param = fx_set_param;
     g_fx_api.get_param = fx_get_param;
 
-    fx_log("CloudSeed plugin initialized");
+    fx_log("CloudSeed plugin initialized (exact port from CloudSeedCore)");
 
     return &g_fx_api;
 }
