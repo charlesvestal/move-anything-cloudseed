@@ -1,7 +1,7 @@
 {
   "id": "cloudseed",
   "name": "CloudSeed",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Algorithmic reverb - exact port of CloudSeedCore by Ghost Note Audio",
   "author": "Ghost Note Audio / Charles Vestal",
   "dsp": "cloudseed.so",

@@ -2,13 +2,37 @@
 
 Algorithmic reverb audio effect module for Move Anything, based on CloudSeedCore by Ghost Note Audio.
 
+## Prerequisites
+
+- [Move Anything](https://github.com/charlesvestal/move-anything) installed on your Ableton Move
+
+## Installation
+
+### Via Module Store (Recommended)
+
+1. Launch Move Anything on your Move
+2. Select **Module Store** from the main menu
+3. Navigate to **Audio FX** → **CloudSeed**
+4. Select **Install**
+
+### Manual Installation
+
+```bash
+./scripts/install.sh
+```
+
 ## Features
 
-- **Decay**: Feedback amount controlling reverb tail length
 - **Mix**: Dry/wet blend
-- **Pre-Delay**: Initial delay before reverb onset (0-100ms)
-- **Size**: Room size (scales delay network times)
-- **Damping**: High-frequency absorption (darker at higher values)
+- **Decay**: Feedback amount controlling reverb tail length (0.05s to 60s)
+- **Size**: Room size (scales delay network times, 20-1000ms)
+- **Pre-Delay**: Initial delay before reverb onset (0-500ms)
+- **Diffusion**: Input diffuser feedback for density
+- **Low Cut**: Highpass filter on input (20-1000 Hz)
+- **High Cut**: Lowpass filter on input (400-20000 Hz)
+- **Mod Amount**: LFO modulation depth for chorus-like movement
+- **Mod Rate**: LFO rate (0-5 Hz)
+- **Stereo Width**: Stereo decorrelation (cross-seed)
 
 ## Algorithm
 
@@ -38,11 +62,16 @@ Input --> [Pre-delay] --> [Diffuser Network (4x APF)] --> [Delay Network (4x)] -
 
 | Parameter | Range | Default | Description |
 |-----------|-------|---------|-------------|
-| decay | 0.0-1.0 | 0.5 | Reverb tail length |
 | mix | 0.0-1.0 | 0.3 | Dry/wet blend |
-| predelay | 0.0-1.0 | 0.1 | Pre-delay time |
+| decay | 0.0-1.0 | 0.5 | Reverb tail length |
 | size | 0.0-1.0 | 0.5 | Room size |
-| damping | 0.0-1.0 | 0.5 | High-frequency damping |
+| predelay | 0.0-1.0 | 0.0 | Pre-delay time |
+| diffusion | 0.0-1.0 | 0.7 | Input diffuser feedback |
+| low_cut | 0.0-1.0 | 0.0 | Highpass filter frequency |
+| high_cut | 0.0-1.0 | 1.0 | Lowpass filter frequency |
+| mod_amount | 0.0-1.0 | 0.3 | LFO modulation depth |
+| mod_rate | 0.0-1.0 | 0.3 | LFO rate |
+| cross_seed | 0.0-1.0 | 0.5 | Stereo width/decorrelation |
 
 ## Installation
 
