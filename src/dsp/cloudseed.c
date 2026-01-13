@@ -48,8 +48,8 @@
 #define DELAY3_BASE 3947
 #define DELAY4_BASE 4643
 
-/* Allpass coefficient */
-#define APF_COEFF 0.625f
+/* Allpass coefficient - higher = more diffusion/smearing */
+#define APF_COEFF 0.7f
 
 /* LFO settings */
 #define LFO_FREQ 0.3f           /* ~0.3 Hz */
@@ -127,15 +127,15 @@ static void fx_log(const char *msg) {
 }
 
 /*
- * Allpass filter
+ * Allpass filter (CloudSeed topology)
  * Returns filtered output and updates buffer
  */
 static inline float allpass(float in, float *buf, int delay, unsigned int pos) {
     unsigned int read_idx = (pos + DIFF_SIZE - delay) & DIFF_MASK;
     float delayed = buf[read_idx];
-    float out = delayed - APF_COEFF * in;
-    buf[pos & DIFF_MASK] = in + APF_COEFF * delayed;
-    return out;
+    float temp = in + delayed * APF_COEFF;
+    buf[pos & DIFF_MASK] = temp;
+    return delayed - temp * APF_COEFF;
 }
 
 /*
@@ -149,21 +149,23 @@ static inline float lowpass(float in, float *state, float coeff) {
 
 /*
  * Calculate damping coefficient from parameter
- * damping=0 -> cutoff ~16kHz (bright)
- * damping=1 -> cutoff ~2kHz (dark)
+ * One-pole lowpass: y = y + coeff * (x - y)
+ * Higher coeff = less filtering (passes more high freq)
+ * damping=0 -> coeff ~0.95 (bright, minimal filtering)
+ * damping=1 -> coeff ~0.15 (dark, strong filtering)
  */
 static inline float calc_damp_coeff(float damping) {
-    /* Map damping 0-1 to coefficient for one-pole lowpass */
-    /* Higher coefficient = more filtering = darker */
-    return 0.1f + damping * 0.7f;
+    return 0.95f - damping * 0.80f;
 }
 
 /*
  * Calculate actual delay times from size parameter
- * size scales delay times: actual = base * (0.5 + size * 0.5)
+ * size scales delay times: actual = base * (0.3 + size * 1.2)
+ * At size=0: 30% of base (small room)
+ * At size=1: 150% of base (huge hall)
  */
 static inline int scale_delay(int base, float size) {
-    float scale = 0.5f + size * 0.5f;
+    float scale = 0.3f + size * 1.2f;
     int result = (int)(base * scale);
     /* Clamp to valid range */
     if (result < 1) result = 1;
@@ -240,8 +242,9 @@ static void fx_process_block(int16_t *audio_inout, int frames) {
     int delay3 = scale_delay(DELAY3_BASE, g_size);
     int delay4 = scale_delay(DELAY4_BASE, g_size);
 
-    /* Calculate feedback amount from decay (0.3 to 0.95) */
-    float feedback = 0.3f + g_decay * 0.65f;
+    /* Calculate feedback amount from decay (0.5 to 0.995) */
+    /* Higher max feedback allows much longer, lush reverb tails */
+    float feedback = 0.5f + g_decay * 0.495f;
 
     /* Calculate damping coefficient */
     float damp_coeff = calc_damp_coeff(g_damping);
@@ -370,16 +373,17 @@ static void fx_process_block(int16_t *audio_inout, int frames) {
         del4_r = lowpass(del4_r, &g_damp4_r, damp_coeff);
 
         /* === Hadamard Feedback Matrix === */
-        /* Mix delay outputs before feeding back to diffuser */
-        g_fb1_l = (del1_l + del2_l + del3_l + del4_l) * 0.25f * feedback;
-        g_fb2_l = (del1_l - del2_l + del3_l - del4_l) * 0.25f * feedback;
-        g_fb3_l = (del1_l + del2_l - del3_l - del4_l) * 0.25f * feedback;
-        g_fb4_l = (del1_l - del2_l - del3_l + del4_l) * 0.25f * feedback;
+        /* Mix delay outputs before feeding back to delay network */
+        /* 0.5f is proper normalization for 4x4 Hadamard (1/sqrt(4)) */
+        g_fb1_l = (del1_l + del2_l + del3_l + del4_l) * 0.5f * feedback;
+        g_fb2_l = (del1_l - del2_l + del3_l - del4_l) * 0.5f * feedback;
+        g_fb3_l = (del1_l + del2_l - del3_l - del4_l) * 0.5f * feedback;
+        g_fb4_l = (del1_l - del2_l - del3_l + del4_l) * 0.5f * feedback;
 
-        g_fb1_r = (del1_r + del2_r + del3_r + del4_r) * 0.25f * feedback;
-        g_fb2_r = (del1_r - del2_r + del3_r - del4_r) * 0.25f * feedback;
-        g_fb3_r = (del1_r + del2_r - del3_r - del4_r) * 0.25f * feedback;
-        g_fb4_r = (del1_r - del2_r - del3_r + del4_r) * 0.25f * feedback;
+        g_fb1_r = (del1_r + del2_r + del3_r + del4_r) * 0.5f * feedback;
+        g_fb2_r = (del1_r - del2_r + del3_r - del4_r) * 0.5f * feedback;
+        g_fb3_r = (del1_r + del2_r - del3_r - del4_r) * 0.5f * feedback;
+        g_fb4_r = (del1_r - del2_r - del3_r + del4_r) * 0.5f * feedback;
 
         /* === Output === */
         /* Sum delay outputs for wet signal */
