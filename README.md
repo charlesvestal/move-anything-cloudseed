@@ -50,7 +50,7 @@ The module installs to `/data/UserData/move-anything/modules/chain/audio_fx/clou
 
 ## Credits
 
-- **CloudSeedCore algorithm**: Ghost Note Audio (MIT License)
+- **CloudSeed algorithm**: [Ghost Note Audio / ValdemarOrn](https://github.com/ValdemarOrn/CloudSeed) (MIT License)
 - **Move Anything port**: Charles Vestal
 
 ## License
