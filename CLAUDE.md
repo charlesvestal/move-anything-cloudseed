@@ -4,79 +4,106 @@ Instructions for Claude Code when working with this repository.
 
 ## Project Overview
 
-CloudSeed is an audio effect module for Move Anything that provides modern algorithmic reverb based on CloudSeedCore by Ghost Note Audio. It features allpass diffusion and modulated delay networks for rich, diffuse reverb tails.
+CloudSeed is an audio effect module for Move Anything that provides modern algorithmic reverb. This is an **exact port** of CloudSeedCore by Ghost Note Audio (MIT Licensed).
 
 ## Architecture
 
 ```
 src/
   dsp/
-    cloudseed.c         # Main DSP implementation
+    cloudseed.c         # Main DSP implementation (exact CloudSeedCore port)
     audio_fx_api_v1.h   # Audio FX API (from move-anything)
     plugin_api_v1.h     # Plugin API types (from move-anything)
+  chain_patches/        # Signal chain presets for Move Anything
+    cloudseed_reverb.json
+    cloudseed_hall.json
+    cloudseed_shimmer.json
+    cloudseed_room.json
   module.json           # Module metadata
 ```
 
 ## Key Implementation Details
 
-### Audio FX API
+### Components (Exact from CloudSeedCore)
 
-Implements Move Anything audio_fx_api_v1:
-- `on_load`: Initialize buffers and DSP state
-- `on_unload`: Cleanup
-- `process_block`: In-place stereo audio processing
-- `set_param`: decay, mix, predelay, size, damping
-- `get_param`: Returns current parameter values
-
-### DSP Components
-
-1. **Pre-delay**: Simple delay line (0-100ms, 4410 samples max)
-2. **Diffuser Network**: 4 cascaded allpass filters with prime-ish delay times
-3. **Delay Network**: 4 modulated delay lines with LFO modulation
-4. **Hadamard Feedback Matrix**: Mixes delay outputs before feedback
-5. **Damping**: One-pole lowpass per delay line
+1. **LcgRandom**: Linear congruential generator (a=22695477, c=1, mod 2^32)
+2. **RandomBuffer**: Seed-based random generation with crossSeed for stereo decorrelation
+3. **Lp1/Hp1**: One-pole lowpass/highpass filters
+4. **Biquad**: Low shelf and high shelf filters for EQ
+5. **ModulatedAllpass**: Allpass filter with sine LFO modulation and interpolation
+6. **AllpassDiffuser**: 12 cascaded modulated allpass filters
+7. **ModulatedDelay**: Delay line with sine modulation
+8. **MultitapDelay**: Multi-tap delay with 256 taps
+9. **DelayLine**: Combined delay + diffuser + shelf EQ + lowpass damping
+10. **ReverbChannel**: Full reverb channel with pre-delay, multitap, diffuser, 12 delay lines
 
 ### Signal Flow
 
 ```
-Input --> [Pre-delay] --> [Diffuser (4x APF)] --> [Delay Network (4x)] --> Output
-                                  ^                        |
-                                  |___ Hadamard feedback __|
+Input → [HP/LP Filters] → [Pre-delay] → [Multitap] → [Input Diffuser]
+    → [8 Delay Lines with feedback] → Output
 ```
 
-### Buffer Sizes
+### Buffer Sizes (from reference)
 
 | Buffer | Size | Purpose |
 |--------|------|---------|
-| Pre-delay | 8192 | Up to ~185ms at 44.1kHz |
-| Diffuser | 512 each | 4 allpass buffers |
-| Delay | 8192 each | 4 delay line buffers |
+| Delay lines | 384000 | ~8.7s at 44.1kHz |
+| Allpass | 19200 | ~435ms at 44.1kHz |
+| Process block | 128 | Block processing size |
 
-### Delay Times (samples at 44.1kHz)
+### Parameters
 
-**Diffusers (prime-ish):** 142, 107, 379, 277
+| Parameter | Range | Description |
+|-----------|-------|-------------|
+| mix | 0-1 | Dry/wet blend |
+| decay | 0-1 | T60 time (0.05s to 60s via Resp3dec) |
+| size | 0-1 | Room size (20-1000ms via Resp2dec) |
+| predelay | 0-1 | Pre-delay (0-500ms via Resp2dec) |
+| diffusion | 0-1 | Input diffuser feedback |
+| low_cut | 0-1 | Highpass filter (20-1000 Hz via Resp4oct) |
+| high_cut | 0-1 | Lowpass filter (400-20000 Hz via Resp4oct) |
+| mod_amount | 0-1 | LFO modulation depth |
+| mod_rate | 0-1 | LFO rate (0-5 Hz via Resp2dec) |
+| cross_seed | 0-1 | Stereo decorrelation |
 
-**Delay Network (primes):** 2473, 3119, 3947, 4643 (scaled by size parameter)
+### CrossSeed Stereo Implementation
 
-### LFO Modulation
-
-- Frequency: ~0.3Hz (slow)
-- Depth: ~3ms (~132 samples)
-- Stereo: L/R have offset LFO phases for width
-
-### Signal Chain Integration
-
-Module declares `"chainable": true` and `"component_type": "audio_fx"` in module.json.
-
-Installs to: `/data/UserData/move-anything/modules/chain/audio_fx/cloudseed/`
+```
+Left channel:  cross_seed = 1.0 - 0.5 * seed_param
+Right channel: cross_seed = 0.5 * seed_param
+```
 
 ## Build Commands
 
 ```bash
 ./scripts/build.sh      # Build for ARM64 via Docker
-./scripts/install.sh    # Deploy to Move
+./scripts/install.sh    # Deploy to Move (module + presets)
 ```
+
+## Presets
+
+The module installs 4 presets to the signal chain patches directory:
+
+- **CloudSeed Reverb**: Balanced reverb with medium decay
+- **CloudSeed Hall**: Large hall with long decay
+- **CloudSeed Shimmer**: Lush, diffuse shimmer effect
+- **CloudSeed Room**: Tight, short room reverb
+
+## Knob Mappings (in presets)
+
+| CC | Parameter |
+|----|-----------|
+| 71 | Synth preset |
+| 72 | Mix |
+| 73 | Decay |
+| 74 | Size |
+| 75 | Diffusion |
+| 76 | Pre-delay |
+| 77 | High Cut |
+| 78 | Mod Amount |
 
 ## Credits
 
 Algorithm based on CloudSeedCore by Ghost Note Audio (MIT Licensed).
+https://github.com/GhostNoteAudio/CloudSeedCore
