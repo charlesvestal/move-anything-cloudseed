@@ -64,9 +64,15 @@ cat src/module.json > dist/cloudseed/module.json
 cat build/cloudseed.so > dist/cloudseed/cloudseed.so
 chmod +x dist/cloudseed/cloudseed.so
 
+# Create tarball for release
+cd dist
+tar -czvf cloudseed-module.tar.gz cloudseed/
+cd ..
+
 echo ""
 echo "=== Build Complete ==="
 echo "Output: dist/cloudseed/"
+echo "Tarball: dist/cloudseed-module.tar.gz"
 echo ""
 echo "To install on Move:"
 echo "  ./scripts/install.sh"
