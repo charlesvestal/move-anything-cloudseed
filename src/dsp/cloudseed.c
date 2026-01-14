@@ -1218,6 +1218,55 @@ static void fx_log(const char *msg) {
     }
 }
 
+/* ============================================================================
+ * V2 API - Instance-based
+ * ============================================================================ */
+
+#define AUDIO_FX_API_VERSION_2 2
+#define AUDIO_FX_INIT_V2_SYMBOL "move_audio_fx_init_v2"
+
+typedef struct audio_fx_api_v2 {
+    uint32_t api_version;
+    void* (*create_instance)(const char *module_dir, const char *config_json);
+    void (*destroy_instance)(void *instance);
+    void (*process_block)(void *instance, int16_t *audio_inout, int frames);
+    void (*set_param)(void *instance, const char *key, const char *val);
+    int (*get_param)(void *instance, const char *key, char *buf, int buf_len);
+} audio_fx_api_v2_t;
+
+typedef audio_fx_api_v2_t* (*audio_fx_init_v2_fn)(const host_api_v1_t *host);
+
+/* Instance structure for v2 API */
+typedef struct {
+    /* Module directory */
+    char module_dir[256];
+
+    /* Parameters (0-1 normalized) */
+    float input_mix;
+    float predelay;
+    float decay;
+    float size;
+    float diffusion;
+    float mix;
+    float low_cut;
+    float high_cut;
+    float cross_seed;
+    float mod_rate;
+    float mod_amount;
+
+    /* Reverb channels */
+    reverb_channel_t *channel_l;
+    reverb_channel_t *channel_r;
+} cloudseed_instance_t;
+
+static void v2_log(const char *msg) {
+    if (g_host && g_host->log) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "[cloudseed-v2] %s", msg);
+        g_host->log(buf);
+    }
+}
+
 static void apply_parameters(void) {
     if (!g_channel_l || !g_channel_r) return;
 
@@ -1477,4 +1526,297 @@ audio_fx_api_v1_t* move_audio_fx_init_v1(const host_api_v1_t *host) {
     fx_log("CloudSeed plugin initialized (exact port from CloudSeedCore)");
 
     return &g_fx_api;
+}
+
+/* ============================================================================
+ * V2 API IMPLEMENTATION
+ * ============================================================================ */
+
+static void v2_apply_parameters(cloudseed_instance_t *inst) {
+    if (!inst->channel_l || !inst->channel_r) return;
+
+    int samplerate = SAMPLE_RATE;
+
+    /* Pre-delay: 0-500ms using Resp2dec curve */
+    float predelay_ms = resp2dec(inst->predelay) * 500.0f;
+    int predelay_samples = (int)(predelay_ms / 1000.0f * samplerate);
+    if (predelay_samples < 1) predelay_samples = 1;
+    inst->channel_l->predelay.sample_delay = predelay_samples;
+    inst->channel_r->predelay.sample_delay = predelay_samples;
+
+    /* Room size: 20-1000ms using Resp2dec curve */
+    float line_size_ms = 20.0f + resp2dec(inst->size) * 980.0f;
+    int line_delay_samples = (int)(line_size_ms / 1000.0f * samplerate);
+
+    /* Decay: 0.05-60 seconds using Resp3dec curve */
+    float decay_seconds = 0.05f + resp3dec(inst->decay) * 59.95f;
+    float line_decay_samples = decay_seconds * samplerate;
+
+    /* Modulation amounts */
+    float line_mod_amount = inst->mod_amount * 2.5f * samplerate / 1000.0f;
+    float line_mod_rate = resp2dec(inst->mod_rate) * 5.0f;
+
+    float late_diff_mod_amount = inst->mod_amount * 2.5f * samplerate / 1000.0f;
+    float late_diff_mod_rate = resp2dec(inst->mod_rate) * 5.0f;
+
+    /* Update delay lines */
+    channel_update_lines(inst->channel_l, line_delay_samples, line_decay_samples,
+                          line_mod_amount, line_mod_rate,
+                          late_diff_mod_amount, late_diff_mod_rate);
+    channel_update_lines(inst->channel_r, line_delay_samples, line_decay_samples,
+                          line_mod_amount, line_mod_rate,
+                          late_diff_mod_amount, late_diff_mod_rate);
+
+    /* Early diffuser settings */
+    int diff_stages = 4 + (int)(inst->diffusion * 7.999f);
+    inst->channel_l->diffuser.stages = diff_stages;
+    inst->channel_r->diffuser.stages = diff_stages;
+
+    float diff_delay_ms = 10.0f + inst->size * 90.0f;
+    int diff_delay = (int)(diff_delay_ms / 1000.0f * samplerate);
+    diffuser_set_delay(&inst->channel_l->diffuser, diff_delay);
+    diffuser_set_delay(&inst->channel_r->diffuser, diff_delay);
+
+    diffuser_set_feedback(&inst->channel_l->diffuser, inst->diffusion);
+    diffuser_set_feedback(&inst->channel_r->diffuser, inst->diffusion);
+
+    float diff_mod_amount = inst->mod_amount * 2.5f * samplerate / 1000.0f;
+    diffuser_set_mod_amount(&inst->channel_l->diffuser, diff_mod_amount);
+    diffuser_set_mod_amount(&inst->channel_r->diffuser, diff_mod_amount);
+
+    float diff_mod_rate = resp2dec(inst->mod_rate) * 5.0f;
+    diffuser_set_mod_rate(&inst->channel_l->diffuser, diff_mod_rate);
+    diffuser_set_mod_rate(&inst->channel_r->diffuser, diff_mod_rate);
+
+    /* Input filters */
+    float low_cut_hz = 20.0f + resp4oct(inst->low_cut) * 980.0f;
+    float high_cut_hz = 400.0f + resp4oct(inst->high_cut) * 19600.0f;
+    hp1_set_cutoff(&inst->channel_l->high_pass, low_cut_hz);
+    hp1_set_cutoff(&inst->channel_r->high_pass, low_cut_hz);
+    lp1_set_cutoff(&inst->channel_l->low_pass, high_cut_hz);
+    lp1_set_cutoff(&inst->channel_r->low_pass, high_cut_hz);
+
+    /* Cross seed for stereo */
+    channel_set_cross_seed(inst->channel_l, inst->cross_seed);
+    channel_set_cross_seed(inst->channel_r, inst->cross_seed);
+    channel_update_post_diffusion(inst->channel_l);
+    channel_update_post_diffusion(inst->channel_r);
+
+    /* EQ cutoff in delay lines (damping) */
+    float eq_cutoff = 400.0f + resp4oct(inst->high_cut * 0.8f) * 19600.0f;
+    for (int i = 0; i < MAX_LINE_COUNT; i++) {
+        delay_line_set_cutoff(&inst->channel_l->lines[i], eq_cutoff);
+        delay_line_set_cutoff(&inst->channel_r->lines[i], eq_cutoff);
+        inst->channel_l->lines[i].cutoff_enabled = 1;
+        inst->channel_r->lines[i].cutoff_enabled = 1;
+    }
+
+    /* Output mix */
+    inst->channel_l->dry_out = 0.0f;
+    inst->channel_r->dry_out = 0.0f;
+    inst->channel_l->line_out = 1.0f;
+    inst->channel_r->line_out = 1.0f;
+}
+
+static void* v2_create_instance(const char *module_dir, const char *config_json) {
+    v2_log("Creating instance");
+
+    cloudseed_instance_t *inst = (cloudseed_instance_t*)calloc(1, sizeof(cloudseed_instance_t));
+    if (!inst) {
+        v2_log("Failed to allocate instance");
+        return NULL;
+    }
+
+    if (module_dir) {
+        strncpy(inst->module_dir, module_dir, sizeof(inst->module_dir) - 1);
+    }
+
+    /* Set default parameters */
+    inst->input_mix = 1.0f;
+    inst->predelay = 0.0f;
+    inst->decay = 0.5f;
+    inst->size = 0.5f;
+    inst->diffusion = 0.7f;
+    inst->mix = 0.3f;
+    inst->low_cut = 0.0f;
+    inst->high_cut = 1.0f;
+    inst->cross_seed = 0.5f;
+    inst->mod_rate = 0.3f;
+    inst->mod_amount = 0.3f;
+
+    /* Allocate reverb channels */
+    inst->channel_l = (reverb_channel_t*)malloc(sizeof(reverb_channel_t));
+    inst->channel_r = (reverb_channel_t*)malloc(sizeof(reverb_channel_t));
+
+    if (!inst->channel_l || !inst->channel_r) {
+        v2_log("Failed to allocate reverb channels");
+        if (inst->channel_l) free(inst->channel_l);
+        if (inst->channel_r) free(inst->channel_r);
+        free(inst);
+        return NULL;
+    }
+
+    channel_init(inst->channel_l, SAMPLE_RATE, 0);
+    channel_init(inst->channel_r, SAMPLE_RATE, 1);
+
+    v2_apply_parameters(inst);
+
+    v2_log("Instance created");
+    return inst;
+}
+
+static void v2_destroy_instance(void *instance) {
+    cloudseed_instance_t *inst = (cloudseed_instance_t*)instance;
+    if (!inst) return;
+
+    v2_log("Destroying instance");
+
+    if (inst->channel_l) {
+        channel_free(inst->channel_l);
+        free(inst->channel_l);
+    }
+    if (inst->channel_r) {
+        channel_free(inst->channel_r);
+        free(inst->channel_r);
+    }
+
+    free(inst);
+}
+
+static void v2_process_block(void *instance, int16_t *audio_inout, int frames) {
+    cloudseed_instance_t *inst = (cloudseed_instance_t*)instance;
+    if (!inst || !inst->channel_l || !inst->channel_r) return;
+
+    /* Process in chunks of BUFFER_SIZE */
+    int offset = 0;
+    while (offset < frames) {
+        int chunk = frames - offset;
+        if (chunk > BUFFER_SIZE) chunk = BUFFER_SIZE;
+
+        float in_l[BUFFER_SIZE];
+        float in_r[BUFFER_SIZE];
+        float out_l[BUFFER_SIZE];
+        float out_r[BUFFER_SIZE];
+
+        /* Convert to float */
+        for (int i = 0; i < chunk; i++) {
+            in_l[i] = audio_inout[(offset + i) * 2] / 32768.0f;
+            in_r[i] = audio_inout[(offset + i) * 2 + 1] / 32768.0f;
+        }
+
+        /* Process through reverb channels */
+        channel_process(inst->channel_l, in_l, out_l, chunk);
+        channel_process(inst->channel_r, in_r, out_r, chunk);
+
+        /* Mix dry and wet, convert back to int16 */
+        for (int i = 0; i < chunk; i++) {
+            float mixed_l = in_l[i] * (1.0f - inst->mix) + out_l[i] * inst->mix;
+            float mixed_r = in_r[i] * (1.0f - inst->mix) + out_r[i] * inst->mix;
+
+            /* Soft clipping */
+            if (mixed_l > 1.0f) mixed_l = 1.0f;
+            if (mixed_l < -1.0f) mixed_l = -1.0f;
+            if (mixed_r > 1.0f) mixed_r = 1.0f;
+            if (mixed_r < -1.0f) mixed_r = -1.0f;
+
+            audio_inout[(offset + i) * 2] = (int16_t)(mixed_l * 32767.0f);
+            audio_inout[(offset + i) * 2 + 1] = (int16_t)(mixed_r * 32767.0f);
+        }
+
+        offset += chunk;
+    }
+}
+
+static void v2_set_param(void *instance, const char *key, const char *val) {
+    cloudseed_instance_t *inst = (cloudseed_instance_t*)instance;
+    if (!inst) return;
+
+    int need_update = 0;
+    float v = atof(val);
+
+    /* Clamp to 0-1 */
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+
+    if (strcmp(key, "decay") == 0) {
+        inst->decay = v;
+        need_update = 1;
+    } else if (strcmp(key, "mix") == 0) {
+        inst->mix = v;
+    } else if (strcmp(key, "predelay") == 0) {
+        inst->predelay = v;
+        need_update = 1;
+    } else if (strcmp(key, "size") == 0) {
+        inst->size = v;
+        need_update = 1;
+    } else if (strcmp(key, "diffusion") == 0) {
+        inst->diffusion = v;
+        need_update = 1;
+    } else if (strcmp(key, "low_cut") == 0) {
+        inst->low_cut = v;
+        need_update = 1;
+    } else if (strcmp(key, "high_cut") == 0) {
+        inst->high_cut = v;
+        need_update = 1;
+    } else if (strcmp(key, "cross_seed") == 0) {
+        inst->cross_seed = v;
+        need_update = 1;
+    } else if (strcmp(key, "mod_rate") == 0) {
+        inst->mod_rate = v;
+        need_update = 1;
+    } else if (strcmp(key, "mod_amount") == 0) {
+        inst->mod_amount = v;
+        need_update = 1;
+    }
+
+    if (need_update)
+        v2_apply_parameters(inst);
+}
+
+static int v2_get_param(void *instance, const char *key, char *buf, int buf_len) {
+    cloudseed_instance_t *inst = (cloudseed_instance_t*)instance;
+    if (!inst) return -1;
+
+    if (strcmp(key, "decay") == 0) {
+        return snprintf(buf, buf_len, "%.2f", inst->decay);
+    } else if (strcmp(key, "mix") == 0) {
+        return snprintf(buf, buf_len, "%.2f", inst->mix);
+    } else if (strcmp(key, "predelay") == 0) {
+        return snprintf(buf, buf_len, "%.2f", inst->predelay);
+    } else if (strcmp(key, "size") == 0) {
+        return snprintf(buf, buf_len, "%.2f", inst->size);
+    } else if (strcmp(key, "diffusion") == 0) {
+        return snprintf(buf, buf_len, "%.2f", inst->diffusion);
+    } else if (strcmp(key, "low_cut") == 0) {
+        return snprintf(buf, buf_len, "%.2f", inst->low_cut);
+    } else if (strcmp(key, "high_cut") == 0) {
+        return snprintf(buf, buf_len, "%.2f", inst->high_cut);
+    } else if (strcmp(key, "cross_seed") == 0) {
+        return snprintf(buf, buf_len, "%.2f", inst->cross_seed);
+    } else if (strcmp(key, "mod_rate") == 0) {
+        return snprintf(buf, buf_len, "%.2f", inst->mod_rate);
+    } else if (strcmp(key, "mod_amount") == 0) {
+        return snprintf(buf, buf_len, "%.2f", inst->mod_amount);
+    } else if (strcmp(key, "name") == 0) {
+        return snprintf(buf, buf_len, "CloudSeed");
+    }
+    return -1;
+}
+
+static audio_fx_api_v2_t g_fx_api_v2;
+
+audio_fx_api_v2_t* move_audio_fx_init_v2(const host_api_v1_t *host) {
+    g_host = host;
+
+    memset(&g_fx_api_v2, 0, sizeof(g_fx_api_v2));
+    g_fx_api_v2.api_version = AUDIO_FX_API_VERSION_2;
+    g_fx_api_v2.create_instance = v2_create_instance;
+    g_fx_api_v2.destroy_instance = v2_destroy_instance;
+    g_fx_api_v2.process_block = v2_process_block;
+    g_fx_api_v2.set_param = v2_set_param;
+    g_fx_api_v2.get_param = v2_get_param;
+
+    v2_log("CloudSeed v2 plugin initialized");
+
+    return &g_fx_api_v2;
 }
