@@ -1502,6 +1502,23 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return snprintf(buf, buf_len, "%.2f", inst->mod_amount);
     } else if (strcmp(key, "name") == 0) {
         return snprintf(buf, buf_len, "CloudSeed");
+    } else if (strcmp(key, "ui_hierarchy") == 0) {
+        const char *hierarchy = "{"
+            "\"modes\":null,"
+            "\"levels\":{"
+                "\"root\":{"
+                    "\"children\":null,"
+                    "\"knobs\":[\"mix\",\"decay\",\"size\",\"predelay\",\"diffusion\",\"low_cut\",\"high_cut\",\"mod_amount\"],"
+                    "\"params\":[\"mix\",\"decay\",\"size\",\"predelay\",\"diffusion\",\"low_cut\",\"high_cut\",\"mod_amount\",\"mod_rate\",\"cross_seed\"]"
+                "}"
+            "}"
+        "}";
+        int len = strlen(hierarchy);
+        if (len < buf_len) {
+            strcpy(buf, hierarchy);
+            return len;
+        }
+        return -1;
     }
     return -1;
 }
