@@ -32,6 +32,7 @@
 #define MAX_DIFFUSER_STAGES 12        /* MaxStageCount from AllpassDiffuser.h */
 #define MAX_TAPS 256                  /* MaxTaps from MultitapDelay.h */
 #define MODULATION_UPDATE_RATE 8      /* Exact from reference */
+#define DELAY_SMOOTH_COEFF 0.00008f   /* Smoothing for delay changes (~250ms settle at 44.1kHz) */
 
 /* ============================================================================
  * UTILITY FUNCTIONS - From Utils.h
@@ -355,15 +356,23 @@ typedef struct {
     float gain_a;
     float gain_b;
 
-    int sample_delay;
+    int sample_delay;           /* Current delay (integer for read index) */
+    float sample_delay_current; /* Smoothed delay (float for interpolation) */
+    int sample_delay_target;    /* Target delay for smoothing */
     float feedback;
     float mod_amount;
     float mod_rate;
     int interpolation_enabled;
     int modulation_enabled;
-} mod_allpass_t;
+} mod_allpass_t;;
 
 static void mod_allpass_update(mod_allpass_t *ap) {
+    /* Smooth delay toward target (called every MODULATION_UPDATE_RATE samples) */
+    float target = (float)ap->sample_delay_target;
+    float smooth_factor = 1.0f - powf(1.0f - DELAY_SMOOTH_COEFF, MODULATION_UPDATE_RATE);
+    ap->sample_delay_current += (target - ap->sample_delay_current) * smooth_factor;
+    ap->sample_delay = (int)ap->sample_delay_current;
+
     ap->mod_phase += ap->mod_rate * MODULATION_UPDATE_RATE;
     if (ap->mod_phase > 1.0f)
         ap->mod_phase = fmodf(ap->mod_phase, 1.0f);
@@ -371,10 +380,10 @@ static void mod_allpass_update(mod_allpass_t *ap) {
     float mod = sinf(ap->mod_phase * 2.0f * M_PI);
 
     float mod_amt = ap->mod_amount;
-    if (mod_amt >= ap->sample_delay)
-        mod_amt = ap->sample_delay - 1;
+    if (mod_amt >= ap->sample_delay_current)
+        mod_amt = ap->sample_delay_current - 1.0f;
 
-    float total_delay = ap->sample_delay + mod_amt * mod;
+    float total_delay = ap->sample_delay_current + mod_amt * mod;
     if (total_delay <= 0.0f)
         total_delay = 1.0f;
 
@@ -398,6 +407,8 @@ static void mod_allpass_init(mod_allpass_t *ap) {
     ap->gain_b = 0.0f;
 
     ap->sample_delay = 100;
+    ap->sample_delay_current = 100.0f;
+    ap->sample_delay_target = 100;
     ap->feedback = 0.5f;
     ap->mod_amount = 0.0f;
     ap->mod_rate = 0.0f;
@@ -408,20 +419,27 @@ static void mod_allpass_init(mod_allpass_t *ap) {
 }
 
 static void mod_allpass_process_no_mod(mod_allpass_t *ap, float *input, float *output, int count) {
-    int delayed_index = ap->index - ap->sample_delay;
-    if (delayed_index < 0) delayed_index += ALLPASS_BUFFER_SIZE;
-
     for (int i = 0; i < count; i++) {
-        float buf_out = ap->buffer[delayed_index];
+        /* Smooth delay toward target */
+        float target = (float)ap->sample_delay_target;
+        ap->sample_delay_current += (target - ap->sample_delay_current) * DELAY_SMOOTH_COEFF;
+        ap->sample_delay = (int)ap->sample_delay_current;
+
+        /* Interpolated read for smooth transitions */
+        float frac = ap->sample_delay_current - (float)ap->sample_delay;
+        int idx_a = ap->index - ap->sample_delay;
+        int idx_b = idx_a - 1;
+        if (idx_a < 0) idx_a += ALLPASS_BUFFER_SIZE;
+        if (idx_b < 0) idx_b += ALLPASS_BUFFER_SIZE;
+
+        float buf_out = ap->buffer[idx_a] * (1.0f - frac) + ap->buffer[idx_b] * frac;
         float in_val = input[i] + buf_out * ap->feedback;
 
         ap->buffer[ap->index] = in_val;
         output[i] = buf_out - in_val * ap->feedback;
 
         ap->index++;
-        delayed_index++;
         if (ap->index >= ALLPASS_BUFFER_SIZE) ap->index -= ALLPASS_BUFFER_SIZE;
-        if (delayed_index >= ALLPASS_BUFFER_SIZE) delayed_index -= ALLPASS_BUFFER_SIZE;
         ap->samples_processed++;
     }
 }
@@ -486,9 +504,9 @@ static void diffuser_update(allpass_diffuser_t *d) {
     for (int i = 0; i < MAX_DIFFUSER_STAGES; i++) {
         float r = d->seed_values[i];
         float scale = powf(10.0f, r) * 0.1f;  /* 0.1 to 1.0 */
-        d->filters[i].sample_delay = (int)(d->delay * scale);
-        if (d->filters[i].sample_delay < 1)
-            d->filters[i].sample_delay = 1;
+        int target = (int)(d->delay * scale);
+        if (target < 1) target = 1;
+        d->filters[i].sample_delay_target = target;
     }
 }
 
@@ -596,18 +614,26 @@ typedef struct {
     float gain_a;
     float gain_b;
 
-    int sample_delay;
+    int sample_delay;           /* Current delay (integer for read index) */
+    float sample_delay_current; /* Smoothed delay (float for interpolation) */
+    int sample_delay_target;    /* Target delay for smoothing */
     float mod_amount;
     float mod_rate;
-} mod_delay_t;
+} mod_delay_t;;
 
 static void mod_delay_update(mod_delay_t *d) {
+    /* Smooth delay toward target (called every MODULATION_UPDATE_RATE samples) */
+    float target = (float)d->sample_delay_target;
+    float smooth_factor = 1.0f - powf(1.0f - DELAY_SMOOTH_COEFF, MODULATION_UPDATE_RATE);
+    d->sample_delay_current += (target - d->sample_delay_current) * smooth_factor;
+    d->sample_delay = (int)d->sample_delay_current;
+
     d->mod_phase += d->mod_rate * MODULATION_UPDATE_RATE;
     if (d->mod_phase > 1.0f)
         d->mod_phase = fmodf(d->mod_phase, 1.0f);
 
     float mod = sinf(d->mod_phase * 2.0f * M_PI);
-    float total_delay = d->sample_delay + d->mod_amount * mod;
+    float total_delay = d->sample_delay_current + d->mod_amount * mod;
 
     int delay_a = (int)total_delay;
     int delay_b = (int)total_delay + 1;
@@ -634,6 +660,8 @@ static void mod_delay_init(mod_delay_t *d) {
     d->gain_b = 0.0f;
 
     d->sample_delay = 100;
+    d->sample_delay_current = 100.0f;
+    d->sample_delay_target = 100;
     d->mod_amount = 0.0f;
     d->mod_rate = 0.0f;
 
@@ -887,7 +915,7 @@ static void delay_line_set_diffuser_seed(delay_line_t *dl, int seed, float cross
 }
 
 static void delay_line_set_delay(delay_line_t *dl, int samples) {
-    dl->delay.sample_delay = samples;
+    dl->delay.sample_delay_target = samples;
 }
 
 static void delay_line_set_feedback(delay_line_t *dl, float fb) {
@@ -1244,8 +1272,8 @@ static void v2_apply_parameters(cloudseed_instance_t *inst) {
     float predelay_ms = resp2dec(inst->predelay) * 500.0f;
     int predelay_samples = (int)(predelay_ms / 1000.0f * samplerate);
     if (predelay_samples < 1) predelay_samples = 1;
-    inst->channel_l->predelay.sample_delay = predelay_samples;
-    inst->channel_r->predelay.sample_delay = predelay_samples;
+    inst->channel_l->predelay.sample_delay_target = predelay_samples;
+    inst->channel_r->predelay.sample_delay_target = predelay_samples;
 
     /* Room size: 20-1000ms using Resp2dec curve */
     float line_size_ms = 20.0f + resp2dec(inst->size) * 980.0f;
