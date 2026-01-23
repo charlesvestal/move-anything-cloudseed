@@ -14,11 +14,6 @@ src/
     cloudseed.c         # Main DSP implementation (exact CloudSeedCore port)
     audio_fx_api_v1.h   # Audio FX API (from move-anything)
     plugin_api_v1.h     # Plugin API types (from move-anything)
-  chain_patches/        # Signal chain presets for Move Anything
-    cloudseed_reverb.json
-    cloudseed_hall.json
-    cloudseed_shimmer.json
-    cloudseed_room.json
   module.json           # Module metadata
 ```
 
@@ -78,30 +73,8 @@ Right channel: cross_seed = 0.5 * seed_param
 
 ```bash
 ./scripts/build.sh      # Build for ARM64 via Docker
-./scripts/install.sh    # Deploy to Move (module + presets)
+./scripts/install.sh    # Deploy to Move
 ```
-
-## Presets
-
-The module installs 4 presets to the signal chain patches directory:
-
-- **CloudSeed Reverb**: Balanced reverb with medium decay
-- **CloudSeed Hall**: Large hall with long decay
-- **CloudSeed Shimmer**: Lush, diffuse shimmer effect
-- **CloudSeed Room**: Tight, short room reverb
-
-## Knob Mappings (in presets)
-
-| CC | Parameter |
-|----|-----------|
-| 71 | Synth preset |
-| 72 | Mix |
-| 73 | Decay |
-| 74 | Size |
-| 75 | Diffusion |
-| 76 | Pre-delay |
-| 77 | High Cut |
-| 78 | Mod Amount |
 
 ## Credits
 
