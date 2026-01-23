@@ -10,6 +10,15 @@
   "capabilities": {
     "chainable": true,
     "component_type": "audio_fx",
+    "ui_hierarchy": {
+      "levels": {
+        "root": {
+          "name": "CloudSeed",
+          "params": ["mix", "decay", "size", "predelay", "diffusion", "low_cut", "high_cut", "mod_amount", "mod_rate", "cross_seed"],
+          "knobs": ["mix", "decay", "size", "predelay", "diffusion", "low_cut", "high_cut", "mod_amount"]
+        }
+      }
+    },
     "chain_params": [
       {
         "key": "mix",
