@@ -1458,9 +1458,39 @@ static void v2_process_block(void *instance, int16_t *audio_inout, int frames) {
     }
 }
 
+/* Helper to extract a JSON number value by key */
+static int json_get_number(const char *json, const char *key, float *out) {
+    char search[64];
+    snprintf(search, sizeof(search), "\"%s\":", key);
+    const char *pos = strstr(json, search);
+    if (!pos) return -1;
+    pos += strlen(search);
+    while (*pos == ' ') pos++;
+    *out = (float)atof(pos);
+    return 0;
+}
+
 static void v2_set_param(void *instance, const char *key, const char *val) {
     cloudseed_instance_t *inst = (cloudseed_instance_t*)instance;
     if (!inst) return;
+
+    /* State restore from patch save */
+    if (strcmp(key, "state") == 0) {
+        float v;
+        int need_update = 0;
+        if (json_get_number(val, "decay", &v) == 0) { inst->decay = v; need_update = 1; }
+        if (json_get_number(val, "mix", &v) == 0) { inst->mix = v; }
+        if (json_get_number(val, "predelay", &v) == 0) { inst->predelay = v; need_update = 1; }
+        if (json_get_number(val, "size", &v) == 0) { inst->size = v; need_update = 1; }
+        if (json_get_number(val, "diffusion", &v) == 0) { inst->diffusion = v; need_update = 1; }
+        if (json_get_number(val, "low_cut", &v) == 0) { inst->low_cut = v; need_update = 1; }
+        if (json_get_number(val, "high_cut", &v) == 0) { inst->high_cut = v; need_update = 1; }
+        if (json_get_number(val, "cross_seed", &v) == 0) { inst->cross_seed = v; need_update = 1; }
+        if (json_get_number(val, "mod_rate", &v) == 0) { inst->mod_rate = v; need_update = 1; }
+        if (json_get_number(val, "mod_amount", &v) == 0) { inst->mod_amount = v; need_update = 1; }
+        if (need_update) v2_apply_parameters(inst);
+        return;
+    }
 
     int need_update = 0;
     float v = atof(val);
@@ -1530,6 +1560,14 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return snprintf(buf, buf_len, "%.2f", inst->mod_amount);
     } else if (strcmp(key, "name") == 0) {
         return snprintf(buf, buf_len, "CloudSeed");
+    } else if (strcmp(key, "state") == 0) {
+        return snprintf(buf, buf_len,
+            "{\"decay\":%.4f,\"mix\":%.4f,\"predelay\":%.4f,\"size\":%.4f,"
+            "\"diffusion\":%.4f,\"low_cut\":%.4f,\"high_cut\":%.4f,"
+            "\"cross_seed\":%.4f,\"mod_rate\":%.4f,\"mod_amount\":%.4f}",
+            inst->decay, inst->mix, inst->predelay, inst->size,
+            inst->diffusion, inst->low_cut, inst->high_cut,
+            inst->cross_seed, inst->mod_rate, inst->mod_amount);
     } else if (strcmp(key, "ui_hierarchy") == 0) {
         const char *hierarchy = "{"
             "\"modes\":null,"
