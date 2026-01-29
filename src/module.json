@@ -4,7 +4,7 @@
   "abbrev": "CS",
   "version": "0.3.2",
   "description": "Algorithmic reverb - exact port of CloudSeedCore by Ghost Note Audio",
-  "author": "Ghost Note Audio / Charles Vestal",
+  "author": "Ghost Note Audio (port: charlesvestal)",
   "license": "MIT",
   "dsp": "cloudseed.so",
   "api_version": 2,
