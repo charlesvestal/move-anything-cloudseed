@@ -1,0 +1,66 @@
+{
+  "title": "CloudSeed",
+  "children": [
+    {
+      "title": "Overview",
+      "lines": [
+        "Algorithmic reverb",
+        "by Ghost Note Audio.",
+        "",
+        "Allpass diffusion",
+        "and modulated delay",
+        "network. Rich stereo",
+        "reverbs from small",
+        "rooms to infinite",
+        "spaces."
+      ]
+    },
+    {
+      "title": "Controls",
+      "children": [
+        {
+          "title": "Knob Mapping",
+          "lines": [
+            "Knob 1: Mix",
+            " Dry/wet blend",
+            "",
+            "Knob 2: Decay",
+            " Tail length",
+            " (0.05s to 60s)",
+            "",
+            "Knob 3: Size",
+            " Room size",
+            " (20-1000ms delays)",
+            "",
+            "Knob 4: Pre-delay",
+            " Initial delay",
+            " (0-500ms)",
+            "",
+            "Knob 5: Diffusion",
+            " Echo density"
+          ]
+        },
+        {
+          "title": "Filters & Mod",
+          "lines": [
+            "Knob 6: Low Cut",
+            " Highpass (20-1kHz)",
+            "",
+            "Knob 7: High Cut",
+            " Lowpass (400-20kHz)",
+            "",
+            "Knob 8: Mod Amount",
+            " LFO chorus depth",
+            "",
+            "Mod Rate: LFO speed",
+            " (0-5Hz, via menu)",
+            "",
+            "Cross Seed: stereo",
+            " width/decorrelation",
+            " (via menu)"
+          ]
+        }
+      ]
+    }
+  ]
+}

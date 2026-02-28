@@ -61,6 +61,7 @@ ${CROSS_PREFIX}gcc -Ofast -shared -fPIC \
 # Copy files to dist (use cat to avoid ExtFS deallocation issues with Docker)
 echo "Packaging..."
 cat src/module.json > dist/cloudseed/module.json
+[ -f src/help.json ] && cat src/help.json > dist/cloudseed/help.json
 cat build/cloudseed.so > dist/cloudseed/cloudseed.so
 chmod +x dist/cloudseed/cloudseed.so
 
