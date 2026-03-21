@@ -4,7 +4,7 @@ Instructions for Claude Code when working with this repository.
 
 ## Project Overview
 
-CloudSeed is an audio effect module for Move Anything that provides modern algorithmic reverb. This is an **exact port** of CloudSeedCore by Ghost Note Audio (MIT Licensed).
+CloudSeed is an audio effect module for Schwung that provides modern algorithmic reverb. This is an **exact port** of CloudSeedCore by Ghost Note Audio (MIT Licensed).
 
 ## Architecture
 
@@ -12,8 +12,8 @@ CloudSeed is an audio effect module for Move Anything that provides modern algor
 src/
   dsp/
     cloudseed.c         # Main DSP implementation (exact CloudSeedCore port)
-    audio_fx_api_v1.h   # Audio FX API (from move-anything)
-    plugin_api_v1.h     # Plugin API types (from move-anything)
+    audio_fx_api_v1.h   # Audio FX API (from schwung)
+    plugin_api_v1.h     # Plugin API types (from schwung)
   module.json           # Module metadata
 ```
 
