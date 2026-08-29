@@ -48,6 +48,7 @@
             },
             {
               "key": "predelay",
+              "short_name": "Delay",
               "label": "Pre-Delay",
               "type": "float",
               "min": 0.0,
@@ -68,6 +69,7 @@
             },
             {
               "key": "low_cut",
+              "short_name": "LO CUT",
               "label": "Low Cut",
               "type": "float",
               "min": 0.0,
@@ -78,6 +80,7 @@
             },
             {
               "key": "high_cut",
+              "short_name": "HI CUT",
               "label": "High Cut",
               "type": "float",
               "min": 0.0,
@@ -88,6 +91,7 @@
             },
             {
               "key": "mod_amount",
+              "short_name": "MOD",
               "label": "Mod Amount",
               "type": "float",
               "min": 0.0,
@@ -98,6 +102,7 @@
             },
             {
               "key": "mod_rate",
+              "short_name": "Rate",
               "label": "Mod Rate",
               "type": "float",
               "min": 0.0,
