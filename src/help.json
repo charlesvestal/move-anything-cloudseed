@@ -52,12 +52,20 @@
             "Knob 8: Mod Amount",
             " LFO chorus depth",
             "",
-            "Mod Rate: LFO speed",
-            " (0-5Hz, via menu)",
+            "Two more params",
+            "follow the eight",
+            "knobs. There is no",
+            "submenu - they sit",
+            "on the next knob",
+            "page:",
             "",
-            "Cross Seed: stereo",
-            " width/decorrelation",
-            " (via menu)"
+            "Mod Rate: LFO speed",
+            " (0-5Hz)",
+            "",
+            "Stereo Width: the",
+            " cross_seed control,",
+            " stereo",
+            " decorrelation."
           ]
         }
       ]
